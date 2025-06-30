@@ -1,0 +1,24 @@
+# YouTube API
+google-api-python-client
+oauth2client
+
+# Video download
+yt-dlp
+
+# Video/audio processing
+moviepy
+ffmpeg-python
+pydub
+
+# Speech-to-text (OpenAI Whisper)
+git+https://github.com/openai/whisper.git@main
+
+# HTTP, config, and utilities
+selenium
+webdriver-manager
+python-dotenv
+requests
+
+# (Optional) Data handling / ML
+numpy
+librosa      # for audio analysis, if you go deeper
