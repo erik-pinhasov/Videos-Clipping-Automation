@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
+"""
+Test script for YouTube Shorts Automation
+Run this to test the automation on a single video without conflicts.
+"""
 import sys
+
+# Save the original arguments
+original_argv = sys.argv.copy()
+
+# Temporarily set sys.argv to avoid argparse conflicts during imports
+sys.argv = ['test_automation.py']
+
 import time
 import logging
 import subprocess
 import shutil
 import os
 from pathlib import Path
-from logging.handlers import TimedRotatingFileHandler
 
 import config
 from config import Config
@@ -17,6 +27,9 @@ import clipper
 import metadata_generator
 import rumble_uploader
 import youtube_uploader
+
+# Restore the original arguments after all imports
+sys.argv = original_argv
 
 
 def setup_logging():
@@ -90,28 +103,71 @@ def create_silent_audio(output_path: str, duration_sec: int):
     subprocess.run(cmd, check=True, capture_output=True)
 
 
-def process_video(video_info: dict, channel: str, cfg: config.Config, yt_client):
-    """Process a single video through the entire pipeline."""
-    vid = video_info["id"]
-    title = video_info.get("title", "").strip()
-    logging.info("▶ Processing %s (%s) on channel %s", title, vid, channel)
+def test_single_video_local(video_path: str, channel: str = None):
+    """
+    Test function to run the automation pipeline on a local video file.
+    """
+    setup_logging()
+    cfg = config.Config()
+    ensure_dirs()
+
+    # Validate input file
+    video_file = Path(video_path)
+    if not video_file.exists():
+        logging.error("Video file not found: %s", video_path)
+        return False
+
+    # Get available channels
+    available_channels = list(cfg.CHANNEL_LOGOS.keys())
+    if not channel:
+        channel = available_channels[0] if available_channels else None
+        logging.info("No channel specified, using: %s", channel)
+    elif channel not in available_channels:
+        logging.error("Channel '%s' not found. Available: %s", channel, available_channels)
+        return False
 
     try:
-        # 1) Download video
-        logging.info("  • Downloading video...")
-        video_path = download_videos.download_videos(video_info["url"])
-        if not Path(video_path).exists():
-            raise FileNotFoundError(f"Download failed: {video_path}")
+        # Initialize YouTube client
+        yt_client = youtube_uploader.init_youtube_client()
+        logging.info("✓ YouTube client initialized")
+    except Exception as e:
+        logging.error("Failed to initialize YouTube client: %s", e)
+        return False
+
+    # Create fake video info
+    video_id = video_file.stem
+    video_info = {
+        "id": video_id,
+        "title": f"Test Video {video_id}",
+        "url": f"file://{video_path}"
+    }
+
+    logging.info("📹 Testing with local video: %s", video_path)
+
+    try:
+        # Copy video to downloads directory to simulate download
+        target_path = Path(config.DOWNLOAD_DIR) / f"{video_id}.mp4"
+        if not target_path.exists():
+            shutil.copy2(video_path, target_path)
+            logging.info("✓ Copied video to downloads directory")
+
+        # Run the pipeline starting from step 2 (branding)
+        vid = video_info["id"]
+        title = video_info.get("title", "").strip()
+        logging.info("▶ Processing %s (%s) on channel %s", title, vid, channel)
+
+        # Use the copied file as input
+        video_path_input = str(target_path)
 
         # 2) Brand the full video
         logging.info("  • Adding logo overlay...")
         branded = os.path.join(config.DOWNLOAD_DIR, f"{vid}_branded.mp4")
         try:
-            clipper.overlay_logo(video_path, branded, channel)
+            clipper.overlay_logo(video_path_input, branded, channel)
         except Exception as e:
             logging.error("Logo overlay failed: %s", e)
             # Use original video as fallback
-            shutil.copy2(video_path, branded)
+            shutil.copy2(video_path_input, branded)
 
         # 2a) Generate metadata for the full video
         logging.info("  • Generating metadata...")
@@ -124,7 +180,9 @@ def process_video(video_info: dict, channel: str, cfg: config.Config, yt_client)
         # 3) Upload full video to Rumble
         logging.info("  • Uploading to Rumble...")
         try:
-            rumble_uploader.upload_to_rumble(branded, meta_full)
+            rumble_uploader.upload_to_rumble(branded, meta_full["title"], 
+                                           meta_full["description"], 
+                                           meta_full.get("tags", []))
         except Exception as e:
             logging.error("Rumble upload failed: %s", e)
             # Continue with shorts creation even if Rumble fails
@@ -132,18 +190,22 @@ def process_video(video_info: dict, channel: str, cfg: config.Config, yt_client)
         # 4) Create highlight clips for YouTube Shorts
         logging.info("  • Finding highlights...")
         try:
-            highlights = detect_highlights.find_highlights(branded)
+            highlights = detect_highlights(branded)
             if not highlights:
                 logging.warning("No highlights found for %s", vid)
-                return
+                # Create a default highlight from the beginning
+                highlights = [(0, min(60, 300))]  # 60 seconds or less
         except Exception as e:
             logging.error("Highlight generation failed: %s", e)
             # Create a default highlight from the beginning
-            highlights = [{"start": 0, "end": min(60, 300)}]  # 60 seconds or less
+            highlights = [(0, min(60, 300))]  # 60 seconds or less
 
-        logging.info("  • Creating %d highlight clips...", len(highlights))
+        # Convert tuples to dicts for make_clips
+        highlight_dicts = [{"start": start, "end": end} for start, end in highlights]
+
+        logging.info("  • Creating %d highlight clips...", len(highlight_dicts))
         try:
-            clip_paths = clipper.make_clips(branded, highlights, vid, channel)
+            clip_paths = clipper.make_clips(branded, highlight_dicts, vid, channel)
         except Exception as e:
             logging.error("Clip creation failed: %s", e)
             raise
@@ -186,66 +248,36 @@ def process_video(video_info: dict, channel: str, cfg: config.Config, yt_client)
         search_videos.mark_video_used(vid)
         logging.info("✓ Successfully processed %s", vid)
 
+        logging.info("🎉 Test completed successfully!")
+        return True
+        
     except Exception as e:
-        logging.error("Failed to process video %s: %s", vid, e, exc_info=True)
-        cleanup_resources(vid)
-        raise
-
-
-def main():
-    setup_logging()
-    cfg = config.Config()
-    ensure_dirs()
-
-    try:
-        yt_client = youtube_uploader.init_youtube_client()
-    except Exception as e:
-        logging.error("Failed to initialize YouTube client: %s", e)
-        return
-
-    logging.info("🚀 Starting YouTube automation pipeline...")
-
-    while True:
-        try:
-            videos = search_videos.search_cc_videos(cfg)
-            if not videos:
-                logging.info("No new videos found; sleeping for 1h…")
-                time.sleep(3600)
-                continue
-
-            # CHANNEL_LOGOS is a dictionary, so get the keys
-            channels = list(cfg.CHANNEL_LOGOS.keys())
-            
-            for i, info in enumerate(videos):
-                try:
-                    vid = info["id"]
-                    download_path = Path(config.DOWNLOAD_DIR) / f"{vid}.mp4"
-                    if download_path.exists():
-                        logging.info("⏭ Skipping %s: download already present", vid)
-                        continue
-
-                    channel = channels[i % len(channels)]
-                    process_video(info, channel, cfg, yt_client)
-                    
-                    # Add delay between videos to be respectful
-                    time.sleep(10)
-                    
-                except Exception as e:
-                    logging.error("Failed to process video %s: %s", info.get("id", "unknown"), e)
-                    # Continue with next video instead of stopping
-                    continue
-                    
-        except KeyboardInterrupt:
-            logging.info("Received interrupt signal, shutting down gracefully...")
-            break
-        except Exception as err:
-            logging.error("Error in main loop: %s", err, exc_info=True)
-            # Sleep before retrying instead of exiting
-            logging.info("Retrying in 5 minutes...")
-            time.sleep(300)
-
-    logging.info("🛑 Pipeline stopped.")
+        logging.error("Test failed: %s", e, exc_info=True)
+        return False
 
 
 if __name__ == "__main__":
-    main()
+    # Manual argument parsing to completely avoid argparse conflicts
+    if len(original_argv) < 2:
+        print("Usage: python test_automation.py <video_path> [--channel <channel_name>]")
+        print("Example: python test_automation.py 'video.mp4' --channel 'navwildanimaldocumentary'")
+        sys.exit(1)
+    
+    video_path = original_argv[1]
+    channel = None
+    
+    # Look for --channel argument in original_argv
+    if "--channel" in original_argv:
+        try:
+            channel_index = original_argv.index("--channel") + 1
+            if channel_index < len(original_argv):
+                channel = original_argv[channel_index]
+        except (ValueError, IndexError):
+            pass
+    
+    print(f"\n🧪 Testing automation with local file: {video_path}")
+    if channel:
+        print(f"Using channel: {channel}")
+    
+    success = test_single_video_local(video_path, channel)
+    print(f"\n{'✅ Test passed!' if success else '❌ Test failed!'}")

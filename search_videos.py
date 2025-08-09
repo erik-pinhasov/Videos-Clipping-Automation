@@ -2,122 +2,86 @@
 import os
 import json
 import logging
-from googleapiclient.discovery import build
 import isodate
+from pathlib import Path
 
-from config import YOUTUBE_API_KEY, CHANNELS, MAX_VIDEO_DURATION, USED_FILE
+import config
 
-def _load_used_ids():
-    if not os.path.exists(USED_FILE):
-        return set()
-    with open(USED_FILE, "r") as f:
+def mark_video_used(video_id: str) -> None:
+    """Add video_id to our used_videos.json file so we skip it next time."""
+    used_file = Path(config.USED_FILE)
+    if used_file.exists():
+        with open(used_file, 'r') as f:
+            used_data = json.load(f)
+    else:
+        used_data = {"used_video_ids": []}
+    
+    if video_id not in used_data["used_video_ids"]:
+        used_data["used_video_ids"].append(video_id)
+    
+    with open(used_file, 'w') as f:
+        json.dump(used_data, f, indent=2)
+
+def search_cc_videos(cfg: config.Config):
+    """
+    Search for Creative Commons videos from configured channels.
+    Returns a list of {id, title, url} dicts.
+    """
+    client = cfg.get_search_client()
+    used_file = Path(cfg.USED_FILE)
+    
+    if used_file.exists():
+        with open(used_file, 'r') as f:
+            used_data = json.load(f)
+        used_ids = set(used_data.get("used_video_ids", []))
+    else:
+        used_ids = set()
+
+    results = []
+    
+    for channel_name in cfg.CHANNEL_LOGOS:
+        logging.info("Searching channel: %s", channel_name)
+        
         try:
-            return set(json.load(f))
-        except json.JSONDecodeError:
-            return set()
+            # Search for videos from this channel
+            search_response = client.search().list(
+                q=f"site:youtube.com/c/{channel_name} OR site:youtube.com/@{channel_name}",
+                part="id,snippet",
+                maxResults=10,
+                type="video",
+                videoLicense="creativeCommon",  # Only CC videos
+                order="date"
+            ).execute()
 
-def _save_used_ids(ids):
-    with open(USED_FILE, "w") as f:
-        json.dump(list(ids), f, indent=2)
-
-def _get_channel_id(youtube, identifier):
-    if identifier.startswith("UC"):
-        return identifier
-    resp = youtube.channels().list(
-        part="id", forUsername=identifier, maxResults=1
-    ).execute().get("items", [])
-    if resp:
-        return resp[0]["id"]
-    resp = youtube.search().list(
-        part="snippet", q=identifier, type="channel", maxResults=1
-    ).execute().get("items", [])
-    if resp:
-        return resp[0]["snippet"]["channelId"]
-    raise ValueError(f"Could not resolve channel: {identifier}")
-
-def search_cc_videos(cfg):
-    youtube = build("youtube", "v3", developerKey=cfg.YOUTUBE_API_KEY)
-    used_ids = _load_used_ids()
-    selected = []
-
-    logging.info("Selecting one unused video per channel…")
-    for ch in cfg.CHANNELS:
-        ch_id = _get_channel_id(youtube, ch)
-        logging.info(f" → Channel {ch} (ID={ch_id})")
-
-        # grab top 5 by views
-        items = youtube.search().list(
-            part="id,snippet",
-            channelId=ch_id,
-            type="video",
-            order="viewCount",
-            maxResults=5
-        ).execute().get("items", [])
-
-        for it in items:
-            vid = it["id"]["videoId"]
-            if vid in used_ids:
-                continue
-            # check duration
-            info = youtube.videos().list(
-                part="contentDetails,snippet", id=vid
-            ).execute().get("items", [])
-            if not info:
-                continue
-            dur = isodate.parse_duration(
-                info[0]["contentDetails"]["duration"]
-            ).total_seconds()
-            if dur > cfg.MAX_VIDEO_DURATION:
-                logging.info(f"    skipping {vid}: {dur/60:.1f} min")
-                continue
-
-            # select it
-            title = info[0]["snippet"]["title"]
-            selected.append({
-                "id": vid,
-                "title": title,
-                "url": f"https://www.youtube.com/watch?v={vid}",
-                "duration": int(dur),
-            })
-            used_ids.add(vid)
-            logging.info(f"    picked {vid} ({dur/60:.1f} min): {title}")
-            break
-
-    if not selected:
-        logging.warning("No new videos found — clearing used list and retrying first channel.")
-        used_ids.clear()
-        _save_used_ids(used_ids)
-        # now just grab the top video from CHANNELS[0]
-        first = cfg.CHANNELS[0]
-        ch_id = _get_channel_id(youtube, first)
-        top = youtube.search().list(
-            part="id,snippet", channelId=ch_id, type="video",
-            order="viewCount", maxResults=1
-        ).execute().get("items", [])
-        if top:
-            vid = top[0]["id"]["videoId"]
-            info = youtube.videos().list(
-                part="contentDetails,snippet", id=vid
-            ).execute().get("items", [])[0]
-            dur = isodate.parse_duration(
-                info["contentDetails"]["duration"]
-            ).total_seconds()
-            selected.append({
-                "id": vid,
-                "title": info["snippet"]["title"],
-                "url": f"https://www.youtube.com/watch?v={vid}",
-                "duration": int(dur),
-            })
-            used_ids.add(vid)
-            logging.info(f"    fallback pick {vid} ({dur/60:.1f} min)")
-
-    return selected
-
-def mark_video_used(video_id):
-    """
-    After fully processing a video (download, Rumble, Shorts),
-    call this to record it so we never pick it again.
-    """
-    ids = _load_used_ids()
-    ids.add(video_id)
-    _save_used_ids(ids)
+            for item in search_response.get("items", []):
+                video_id = item["id"]["videoId"]
+                title = item["snippet"]["title"]
+                
+                if video_id in used_ids:
+                    logging.info("  ⏭ Skipping used video: %s", title)
+                    continue
+                
+                # Get video details to check duration
+                video_response = client.videos().list(
+                    part="contentDetails",
+                    id=video_id
+                ).execute()
+                
+                if video_response["items"]:
+                    duration_str = video_response["items"][0]["contentDetails"]["duration"]
+                    duration_sec = isodate.parse_duration(duration_str).total_seconds()
+                    
+                    if duration_sec <= cfg.MAX_VIDEO_DURATION:
+                        results.append({
+                            "id": video_id,
+                            "title": title,
+                            "url": f"https://www.youtube.com/watch?v={video_id}"
+                        })
+                        logging.info("  ✓ Found video: %s (%.1fs)", title, duration_sec)
+                    else:
+                        logging.info("  ⏭ Skipping long video: %s (%.1fs)", title, duration_sec)
+        
+        except Exception as e:
+            logging.error("Error searching channel %s: %s", channel_name, e)
+    
+    return results

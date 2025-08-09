@@ -44,3 +44,28 @@ def download_videos(url: str) -> str:
         filename = os.path.join(DOWNLOAD_DIR, f"{video_id}.{ext}")
     logger.info("Downloaded to %s", filename)
     return filename
+
+if __name__ == "__main__":
+    import logging
+    import sys
+
+    logging.basicConfig(level=logging.INFO)
+    TEST_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # short, fast test video
+
+    print("\n== Testing metadata extraction ==")
+    try:
+        title, description, tags = get_youtube_metadata(TEST_URL)
+        print(f"Title      : {title}")
+        print(f"Description: {description[:100]}{'...' if len(description)>100 else ''}")
+        print(f"Tags       : {tags}\n")
+    except Exception as e:
+        logging.exception("Metadata extraction failed")
+
+    print("== Testing video download ==")
+    try:
+        path = download_videos(TEST_URL)
+        print(f"Downloaded file path: {path}\n")
+    except Exception as e:
+        logging.exception("Download failed")
+
+    print("== All tests completed ==\n")
