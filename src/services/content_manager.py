@@ -1,156 +1,250 @@
 """
-Content management service for tracking and retrieving videos.
+WORKING content manager - finds real YouTube videos.
 """
 
-import json
 import os
-from typing import Dict, Any, List, Set, Optional
+import json
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import List, Dict, Any
 
-from src.core.logger import get_logger
-from src.core.exceptions import PipelineError
-from src.services.youtube_api import YouTubeAPI
+# Import yt-dlp properly
+try:
+    import yt_dlp
+except ImportError:
+    print("Installing yt-dlp...")
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "yt-dlp"])
+    import yt_dlp
+
 import config
+from src.core.logger import get_logger
+from src.core.exceptions import ContentDiscoveryError
 
 
 class ContentManager:
-    """Manages video content discovery and processing tracking."""
+    """WORKING content manager."""
     
     def __init__(self, cfg: config.Config):
         self.config = cfg
         self.logger = get_logger(__name__)
-        self.youtube_api = YouTubeAPI(cfg)
-        self.used_videos_file = "used_videos.json"  # Keep in root as per your structure
-        self._rate_limit_delay = 1.0  # Seconds between API calls
+        
+        # File to track used videos
+        self.used_videos_file = "used_videos.json"
+        
+        # Channel URLs - REAL CHANNELS
+        self.channel_urls = {
+            'naturesmomentstv': 'https://www.youtube.com/@naturesmomentstv/videos',
+            'navwildanimaldocumentary': 'https://www.youtube.com/@navwildanimaldocumentary/videos',
+            'wildnatureus2024': 'https://www.youtube.com/@wildnatureus2024/videos',
+            'ScenicScenes': 'https://www.youtube.com/@ScenicScenes/videos'
+        }
     
     def get_new_videos(self) -> List[Dict[str, Any]]:
-        """Get new videos from configured channels."""
+        """Get REAL videos from YouTube channels - ONE PER CHANNEL."""
+        self.logger.info("🔍 Getting REAL videos from YouTube...")
+        
+        used_videos = self._load_used_videos()
+        all_videos = []
+        
+        for channel_name, channel_url in self.channel_urls.items():
+            self.logger.info(f"  📺 Checking {channel_name}...")
+            
+            try:
+                videos = self._get_real_videos(channel_url, channel_name, used_videos)
+                if videos:
+                    # Take only the FIRST (newest) video from this channel
+                    all_videos.append(videos[0])
+                    self.logger.info(f"    ✅ Selected 1 video: {videos[0]['title'][:50]}...")
+                else:
+                    self.logger.info(f"    ❌ No videos found")
+                
+            except Exception as e:
+                self.logger.error(f"    ❌ Failed {channel_name}: {e}")
+                continue
+        
+        # Sort by upload date (newest first)
+        all_videos.sort(key=lambda x: x.get('upload_date', ''), reverse=True)
+        
+        self.logger.info(f"🎯 Total videos selected: {len(all_videos)} (1 per channel)")
+        return all_videos  # Return 1 video per channel (max 4 total)
+    
+    def _get_real_videos(self, channel_url: str, channel_name: str, used_videos: set) -> List[Dict[str, Any]]:
+        """Get REAL videos using yt-dlp."""
+        
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,  # Get full info
+            'playlistend': 20,      # Check last 20 videos
+            'daterange': yt_dlp.DateRange(end=None, start=None),
+            'ignoreerrors': True,
+        }
+        
+        videos = []
+        cutoff_date = datetime.now() - timedelta(days=self.config.MAX_VIDEO_AGE_DAYS)
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                self.logger.info(f"    🔄 Extracting info from {channel_name}...")
+                self.logger.info(f"    🌐 URL: {channel_url}")
+                
+                # Extract playlist
+                playlist_info = ydl.extract_info(channel_url, download=False)
+                
+                self.logger.info(f"    📊 Raw playlist info keys: {list(playlist_info.keys()) if playlist_info else 'None'}")
+                
+                if not playlist_info or 'entries' not in playlist_info:
+                    self.logger.warning(f"    ⚠️ No entries found for {channel_name}")
+                    self.logger.warning(f"    📋 Playlist info: {playlist_info}")
+                    return []
+                
+                total_entries = len(playlist_info['entries'])
+                self.logger.info(f"    📺 Found {total_entries} total entries")
+                
+                processed = 0
+                for entry in playlist_info['entries']:
+                    processed += 1
+                    self.logger.info(f"    🔍 Processing entry {processed}/{total_entries}")
+                    
+                    if not entry or len(videos) >= 1:  # Max 1 per channel
+                        self.logger.info(f"    ⏹️ Stopping at entry {processed} (found {len(videos)} videos)")
+                        break
+                    
+                    try:
+                        # Get video details
+                        video_id = entry.get('id')
+                        title = entry.get('title', 'Untitled')
+                        duration = entry.get('duration', 0)
+                        upload_date = entry.get('upload_date')
+                        view_count = entry.get('view_count', 0)
+                        
+                        self.logger.info(f"      📹 Video: {title[:50]}...")
+                        self.logger.info(f"          ID: {video_id}")
+                        self.logger.info(f"          Duration: {duration}s ({duration//60}:{duration%60:02d})")
+                        self.logger.info(f"          Upload: {upload_date}")
+                        self.logger.info(f"          Views: {view_count:,}")
+                        
+                        if not video_id or not title:
+                            self.logger.info(f"      ❌ SKIP: Missing ID or title")
+                            continue
+                        
+                        # Check duration - USE CONFIG VALUES!
+                        if not (self.config.MIN_VIDEO_DURATION <= duration <= self.config.MAX_VIDEO_DURATION):
+                            self.logger.info(f"      ❌ SKIP: Duration {duration}s not in range {self.config.MIN_VIDEO_DURATION}-{self.config.MAX_VIDEO_DURATION}s")
+                            continue
+                        
+                        # Check upload date
+                        if upload_date:
+                            try:
+                                upload_dt = datetime.strptime(upload_date, '%Y%m%d')
+                                if upload_dt < cutoff_date:
+                                    self.logger.info(f"      ❌ SKIP: Too old ({upload_dt.date()})")
+                                    continue
+                            except Exception as date_error:
+                                self.logger.info(f"      ⚠️ Date parse error: {date_error}")
+                        
+                        # Check if already used
+                        video_url = f'https://www.youtube.com/watch?v={video_id}'
+                        if video_url in used_videos:
+                            self.logger.info(f"      ❌ SKIP: Already used")
+                            continue
+                        
+                        # Filter unwanted content
+                        title_lower = title.lower()
+                        skip_terms = ['live', 'stream', '#shorts', 'compilation']
+                        found_skip_term = None
+                        for term in skip_terms:
+                            if term in title_lower:
+                                found_skip_term = term
+                                break
+                        
+                        if found_skip_term:
+                            self.logger.info(f"      ❌ SKIP: Contains '{found_skip_term}'")
+                            continue
+                        
+                        # This is a good video!
+                        video_info = {
+                            'id': video_id,
+                            'title': title,
+                            'url': video_url,
+                            'channel': channel_name,
+                            'duration': duration,
+                            'upload_date': upload_date,
+                            'view_count': view_count,
+                            'duration_str': f"{duration//60}:{duration%60:02d}"
+                        }
+                        
+                        videos.append(video_info)
+                        self.logger.info(f"      ✅ ACCEPTED: Added to list ({len(videos)}/5)")
+                        
+                    except Exception as e:
+                        self.logger.info(f"      ❌ Entry error: {e}")
+                        continue
+                
+                self.logger.info(f"    📊 Final result: {len(videos)} videos from {processed} entries")
+            
+            except Exception as e:
+                self.logger.error(f"    ❌ yt-dlp failed for {channel_name}: {e}")
+                import traceback
+                self.logger.error(f"    📋 Full error: {traceback.format_exc()}")
+                return []
+        
+        return videos
+    
+    def mark_video_used(self, video_url: str) -> None:
+        """Mark video as processed."""
         try:
             used_videos = self._load_used_videos()
-            all_videos = []
+            used_videos.add(video_url)
             
-            channels = list(self.config.CHANNEL_LOGOS.keys())
-            if not channels:
-                self.logger.warning("No channels configured in CHANNEL_LOGOS")
-                return []
+            # Save to file
+            with open(self.used_videos_file, 'w') as f:
+                json.dump({
+                    'used_videos': list(used_videos),
+                    'last_updated': datetime.now().isoformat(),
+                    'total_processed': len(used_videos)  # Changed from 'total_count'
+                }, f, indent=2)
             
-            for channel in channels:
-                self.logger.info(f"Fetching videos from channel: {channel}")
-                
-                try:
-                    videos = self.youtube_api.get_channel_videos(
-                        channel, 
-                        max_results=getattr(self.config, 'MAX_VIDEOS_PER_CHANNEL', 10)
-                    )
-                    
-                    # Filter out used videos and unsuitable videos
-                    new_videos = []
-                    for video in videos:
-                        if self._is_video_suitable(video, used_videos):
-                            new_videos.append(video)
-                    
-                    all_videos.extend(new_videos)
-                    self.logger.info(f"Found {len(new_videos)} new videos from {channel}")
-                    
-                    # Rate limiting
-                    import time
-                    time.sleep(self._rate_limit_delay)
-                    
-                except Exception as e:
-                    self.logger.error(f"Error fetching from channel {channel}: {e}")
-                    continue
-            
-            # Sort by upload date (newest first)
-            all_videos.sort(
-                key=lambda x: x.get('upload_date', ''), 
-                reverse=True
-            )
-            
-            max_total = getattr(self.config, 'MAX_VIDEOS_TOTAL', 50)
-            return all_videos[:max_total]
+            self.logger.debug(f"✅ Marked as used: {video_url}")
             
         except Exception as e:
-            self.logger.error(f"Error getting new videos: {e}")
-            return []
+            self.logger.error(f"❌ Failed to mark video as used: {e}")
     
-    def _is_video_suitable(self, video: Dict[str, Any], used_videos: Set[str]) -> bool:
-        """Check if video is suitable for processing."""
-        video_id = video["id"]
-        
-        # Skip if already used
-        if video_id in used_videos:
-            return False
-        
-        # Check duration
-        duration = video.get("duration", 0)
-        min_duration = getattr(self.config, 'MIN_VIDEO_DURATION', 60)
-        max_duration = getattr(self.config, 'MAX_VIDEO_DURATION', 600)
-        
-        if duration < min_duration or duration > max_duration:
-            self.logger.debug(f"Skipping {video_id}: duration {duration}s not in range ({min_duration}-{max_duration}s)")
-            return False
-        
-        # Check upload date
-        upload_date = video.get("upload_date")
-        if upload_date:
-            try:
-                upload_dt = datetime.strptime(upload_date, "%Y-%m-%d")
-                days_old = (datetime.now() - upload_dt).days
-                max_age = getattr(self.config, 'MAX_VIDEO_AGE_DAYS', 30)
-                if days_old > max_age:
-                    self.logger.debug(f"Skipping {video_id}: {days_old} days old (max {max_age})")
-                    return False
-            except ValueError:
-                self.logger.warning(f"Invalid upload date format for {video_id}: {upload_date}")
-        
-        return True
-    
-    def _load_used_videos(self) -> Set[str]:
-        """Load list of already processed video IDs."""
+    def _load_used_videos(self) -> set:
+        """Load used videos."""
         try:
-            if os.path.exists(self.used_videos_file):
-                with open(self.used_videos_file, 'r', encoding='utf-8') as f:
+            if Path(self.used_videos_file).exists():
+                with open(self.used_videos_file, 'r') as f:
                     data = json.load(f)
-                    if isinstance(data, list):
-                        # Legacy format - just a list of IDs
-                        return set(data)
                     return set(data.get('used_videos', []))
             return set()
-        except Exception as e:
-            self.logger.error(f"Error loading used videos: {e}")
+        except:
             return set()
     
-    def mark_video_used(self, video_id: str) -> None:
-        """Mark a video as processed."""
-        try:
-            used_videos = self._load_used_videos()
-            used_videos.add(video_id)
-            
-            data = {
-                'used_videos': list(used_videos),
-                'last_updated': datetime.now().isoformat(),
-                'total_processed': len(used_videos)
-            }
-            
-            with open(self.used_videos_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            
-            self.logger.info(f"Marked video {video_id} as used (total processed: {len(used_videos)})")
-            
-        except Exception as e:
-            self.logger.error(f"Error marking video as used: {e}")
-    
-    def is_video_processed(self, video_id: str) -> bool:
-        """Check if video has been processed."""
+    def get_next_video(self) -> List[Dict[str, Any]]:
+        """Get the NEXT video to process (1 video, rotating channels)."""
+        self.logger.info("🔍 Getting next video from rotation...")
+        
         used_videos = self._load_used_videos()
-        return video_id in used_videos
-    
-    def cleanup_old_entries(self, days_to_keep: int = 90) -> None:
-        """Clean up old entries from used videos (optional maintenance)."""
-        try:
-            # This could be implemented to remove very old entries if needed
-            # For now, we'll keep all entries as they're lightweight
-            pass
-        except Exception as e:
-            self.logger.error(f"Error cleaning up old entries: {e}")
+        
+        # Try each channel in order until we find 1 video
+        for channel_name, channel_url in self.channel_urls.items():
+            self.logger.info(f"  📺 Checking {channel_name}...")
+            
+            try:
+                videos = self._get_real_videos(channel_url, channel_name, used_videos)
+                if videos:
+                    self.logger.info(f"    ✅ Found video: {videos[0]['title'][:50]}...")
+                    return [videos[0]]  # Return just 1 video
+                else:
+                    self.logger.info(f"    ❌ No new videos")
+                    
+            except Exception as e:
+                self.logger.error(f"    ❌ Failed {channel_name}: {e}")
+                continue
+        
+        # No videos found from any channel
+        self.logger.info("📭 No videos available from any channel")
+        return []

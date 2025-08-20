@@ -1,9 +1,4 @@
-"""
-Resource cleanup utilities for temporary files and directories.
-"""
-
 import os
-import shutil
 import glob
 from pathlib import Path
 from typing import List, Optional
@@ -16,6 +11,7 @@ class ResourceCleaner:
     """Handles cleanup of temporary files and resources."""
     
     def __init__(self):
+        self.config = config.Config()
         self.logger = get_logger(__name__)
     
     def cleanup_video_files(self, video_id: str) -> None:
@@ -25,8 +21,8 @@ class ResourceCleaner:
             
             # Clean download directory
             download_patterns = [
-                f"{config.DOWNLOAD_DIR}/{video_id}*",
-                f"{config.DOWNLOAD_DIR}/*{video_id}*"
+                f"{self.config.DOWNLOAD_DIR}/{video_id}*",
+                f"{self.config.DOWNLOAD_DIR}/*{video_id}*"
             ]
             
             for pattern in download_patterns:
@@ -78,9 +74,9 @@ class ResourceCleaner:
             cutoff_time = current_time - (max_age_hours * 3600)
             
             directories = [
-                config.DOWNLOAD_DIR,
-                config.CLIPS_DIR,
-                config.AUDIO_DIR
+                self.config.DOWNLOAD_DIR,
+                self.config.CLIPS_DIR,
+                self.config.AUDIO_DIR
             ]
             
             total_cleaned = 0

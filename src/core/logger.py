@@ -1,101 +1,49 @@
 """
-Centralized logging configuration for the YouTube Shorts Automation Pipeline.
+Comprehensive logging system with progress tracking.
 """
 
-import logging
-import logging.handlers
+import os
 import sys
+import logging
+import threading
+import time
 from pathlib import Path
-from typing import Optional
 from datetime import datetime
+from typing import Optional, Any
 
 
-class ColoredFormatter(logging.Formatter):
-    """Custom formatter with color support for console output."""
-    
-    # Color codes
-    COLORS = {
-        'DEBUG': '\033[36m',      # Cyan
-        'INFO': '\033[32m',       # Green
-        'WARNING': '\033[33m',    # Yellow
-        'ERROR': '\033[31m',      # Red
-        'CRITICAL': '\033[35m',   # Magenta
-        'RESET': '\033[0m'        # Reset
-    }
-    
-    def format(self, record):
-        # Add color to levelname
-        if record.levelname in self.COLORS:
-            record.levelname = f"{self.COLORS[record.levelname]}{record.levelname}{self.COLORS['RESET']}"
+def setup_logging(level: str = "INFO") -> None:
+    """Setup logging configuration."""
+    try:
+        # Create logs directory
+        Path("logs").mkdir(exist_ok=True)
         
-        # Format the message
-        return super().format(record)
-
-
-def setup_logging(log_level: str = "INFO") -> None:
-    """Setup logging configuration with file and console handlers."""
-    
-    # Create logs directory
-    logs_dir = Path("logs")
-    logs_dir.mkdir(exist_ok=True)
-    
-    # Configure root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-    
-    # Remove existing handlers to avoid duplicates
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    # Create formatters
-    detailed_formatter = logging.Formatter(
-        fmt='%(asctime)s | %(name)-20s | %(levelname)-8s | %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    
-    console_formatter = ColoredFormatter(
-        fmt='%(asctime)s | %(levelname)-8s | %(message)s',
-        datefmt='%H:%M:%S'
-    )
-    
-    # File handler with daily rotation
-    log_file = logs_dir / f"automation_{datetime.now().strftime('%Y-%m-%d')}.log"
-    file_handler = logging.handlers.TimedRotatingFileHandler(
-        filename=log_file,
-        when='midnight',
-        interval=1,
-        backupCount=30,
-        encoding='utf-8'
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(detailed_formatter)
-    
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-    console_handler.setFormatter(console_formatter)
-    
-    # Add handlers to root logger
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
-    
-    # Set specific logger levels
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('googleapiclient').setLevel(logging.WARNING)
-    logging.getLogger('google_auth_httplib2').setLevel(logging.WARNING)
-    logging.getLogger('selenium').setLevel(logging.WARNING)
-    
-    # Log startup message
-    logger = logging.getLogger(__name__)
-    logger.info("=" * 60)
-    logger.info("🚀 YouTube Shorts Automation Pipeline Started")
-    logger.info(f"📝 Log Level: {log_level.upper()}")
-    logger.info(f"📁 Log File: {log_file}")
-    logger.info("=" * 60)
+        # Create log filename with date
+        log_filename = f"logs/automation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        
+        # Configure logging
+        logging.basicConfig(
+            level=getattr(logging, level.upper(), logging.INFO),
+            format='%(asctime)s | %(name)-20s | %(levelname)-8s | %(message)s',
+            handlers=[
+                logging.FileHandler(log_filename, encoding='utf-8'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        
+        # Set third-party loggers to WARNING
+        for logger_name in ['urllib3', 'requests', 'googleapiclient', 'google', 'yt_dlp']:
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
+        
+        print(f"Logging initialized - Log file: {log_filename}")
+        
+    except Exception as e:
+        print(f"Logging setup failed: {e}")
+        logging.basicConfig(level=logging.INFO)
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Get a logger instance for the specified module."""
+    """Get logger instance."""
     return logging.getLogger(name)
 
 
@@ -105,77 +53,57 @@ class LoggerMixin:
     @property
     def logger(self) -> logging.Logger:
         """Get logger for this class."""
-        return get_logger(self.__class__.__name__)
+        if not hasattr(self, '_logger'):
+            self._logger = get_logger(self.__class__.__name__)
+        return self._logger
 
 
 def log_function_call(func):
-    """Decorator to log function calls with timing."""
-    import functools
-    import time
-    
-    @functools.wraps(func)
+    """Decorator to log function calls."""
     def wrapper(*args, **kwargs):
         logger = get_logger(func.__module__)
-        func_name = f"{func.__qualname__}"
-        
-        logger.debug(f"🔧 Calling {func_name}")
-        start_time = time.time()
-        
+        logger.debug(f"Calling {func.__name__}")
         try:
             result = func(*args, **kwargs)
-            elapsed = time.time() - start_time
-            logger.debug(f"✅ {func_name} completed in {elapsed:.2f}s")
+            logger.debug(f"Completed {func.__name__}")
             return result
         except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(f"❌ {func_name} failed after {elapsed:.2f}s: {e}")
+            logger.error(f"Error in {func.__name__}: {e}")
             raise
-    
     return wrapper
 
 
-def create_progress_logger(name: str, total: int) -> 'ProgressLogger':
-    """Create a progress logger for tracking operations."""
-    return ProgressLogger(name, total)
-
-
 class ProgressLogger:
-    """Logger for tracking progress of operations."""
+    """Simple progress logger for tracking operations."""
     
-    def __init__(self, operation_name: str, total: int):
-        self.operation_name = operation_name
+    def __init__(self, task_name: str, total: int):
+        self.task_name = task_name
         self.total = total
         self.current = 0
-        self.logger = get_logger(__name__)
         self.start_time = None
+        self.logger = get_logger("Progress")
     
     def start(self):
-        """Start the progress tracking."""
-        import time
+        """Start progress tracking."""
         self.start_time = time.time()
-        self.logger.info(f"🏁 Starting {self.operation_name} (0/{self.total})")
+        self.logger.info(f"Starting {self.task_name} (0/{self.total})")
     
     def update(self, increment: int = 1, message: str = ""):
         """Update progress."""
         self.current += increment
-        percentage = (self.current / self.total) * 100
+        percentage = (self.current / self.total) * 100 if self.total > 0 else 0
         
-        status_msg = f"⏳ {self.operation_name}: {self.current}/{self.total} ({percentage:.1f}%)"
+        status = f"{self.task_name}: {self.current}/{self.total} ({percentage:.1f}%)"
         if message:
-            status_msg += f" - {message}"
+            status += f" - {message}"
         
-        self.logger.info(status_msg)
+        self.logger.info(status)
     
     def complete(self, message: str = ""):
-        """Mark operation as complete."""
-        import time
-        if self.start_time:
-            elapsed = time.time() - self.start_time
-            completion_msg = f"✅ {self.operation_name} completed in {elapsed:.1f}s"
-        else:
-            completion_msg = f"✅ {self.operation_name} completed"
-        
+        """Complete progress tracking."""
+        elapsed = time.time() - self.start_time if self.start_time else 0
+        status = f"{self.task_name} completed in {elapsed:.1f}s"
         if message:
-            completion_msg += f" - {message}"
+            status += f" - {message}"
         
-        self.logger.info(completion_msg)
+        self.logger.info(status)

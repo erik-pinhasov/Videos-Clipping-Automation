@@ -1,136 +1,138 @@
 """
-Custom exception classes for the YouTube Shorts Automation Pipeline.
+ALL exceptions for the YouTube Shorts automation system - COMPLETE LIST.
 """
 
-from typing import Optional, Any
 
-
-class PipelineError(Exception):
-    """Base exception for pipeline-related errors."""
-    
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[Any] = None):
-        super().__init__(message)
-        self.message = message
-        self.error_code = error_code
-        self.details = details
-    
-    def __str__(self) -> str:
-        if self.error_code:
-            return f"[{self.error_code}] {self.message}"
-        return self.message
-
-
-class ConfigurationError(PipelineError):
-    """Raised when there's a configuration problem."""
+class AutomationError(Exception):
+    """Base exception for automation errors."""
     pass
 
 
-class VideoProcessingError(PipelineError):
-    """Raised when video processing operations fail."""
+class PipelineError(AutomationError):
+    """Error in the processing pipeline."""
     pass
 
 
-class DownloadError(VideoProcessingError):
-    """Raised when video download fails."""
+class VideoProcessingError(AutomationError):
+    """Error during video processing."""
     pass
 
 
-class BrandingError(VideoProcessingError):
-    """Raised when logo branding fails."""
+class DownloadError(AutomationError):
+    """Error during video download."""
     pass
 
 
-class HighlightDetectionError(VideoProcessingError):
-    """Raised when highlight detection fails."""
+class UploadError(AutomationError):
+    """Base class for upload errors."""
     pass
-
-
-class ClipCreationError(VideoProcessingError):
-    """Raised when clip creation fails."""
-    pass
-
-
-class MetadataError(PipelineError):
-    """Raised when metadata generation fails."""
-    pass
-
-
-class UploadError(PipelineError):
-    """Raised when upload operations fail."""
-    
-    def __init__(self, message: str, platform: Optional[str] = None, 
-                 retry_possible: bool = True, **kwargs):
-        super().__init__(message, **kwargs)
-        self.platform = platform
-        self.retry_possible = retry_possible
 
 
 class YouTubeUploadError(UploadError):
-    """Specific exception for YouTube upload failures."""
-    
-    def __init__(self, message: str, **kwargs):
-        super().__init__(message, platform="YouTube", **kwargs)
+    """Error during YouTube upload."""
+    pass
+
+
+class YouTubeAPIError(UploadError):
+    """Error with YouTube API."""
+    pass
 
 
 class RumbleUploadError(UploadError):
-    """Specific exception for Rumble upload failures."""
-    
-    def __init__(self, message: str, **kwargs):
-        super().__init__(message, platform="Rumble", **kwargs)
-
-
-class APIError(PipelineError):
-    """Raised when external API calls fail."""
-    
-    def __init__(self, message: str, api_name: Optional[str] = None, 
-                 status_code: Optional[int] = None, **kwargs):
-        super().__init__(message, **kwargs)
-        self.api_name = api_name
-        self.status_code = status_code
-
-
-class YouTubeAPIError(APIError):
-    """Specific exception for YouTube API failures."""
-    
-    def __init__(self, message: str, **kwargs):
-        super().__init__(message, api_name="YouTube API", **kwargs)
-
-
-class OpenAIAPIError(APIError):
-    """Specific exception for OpenAI API failures."""
-    
-    def __init__(self, message: str, **kwargs):
-        super().__init__(message, api_name="OpenAI API", **kwargs)
-
-
-class ResourceError(PipelineError):
-    """Raised when there are resource-related problems (disk space, file permissions, etc.)."""
+    """Error during Rumble upload."""
     pass
 
 
-class ValidationError(PipelineError):
-    """Raised when data validation fails."""
+class MetadataError(AutomationError):
+    """Error during metadata generation."""
     pass
 
 
-def handle_pipeline_error(func):
-    """Decorator to handle and log pipeline errors gracefully."""
-    import functools
-    from src.core.logger import get_logger
-    
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        logger = get_logger(func.__module__)
-        
-        try:
-            return func(*args, **kwargs)
-        except PipelineError as e:
-            logger.error(f"Pipeline error in {func.__name__}: {e}")
-            if e.details:
-                logger.debug(f"Error details: {e.details}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in {func.__name__}: {e}", exc_info=True)
-            raise PipelineError(f"Unexpected error in {func.__name__}: {str(e)}")
-    
-    return wrapper
+class OpenAIError(AutomationError):
+    """Error with OpenAI API."""
+    pass
+
+
+class QuotaExceededError(AutomationError):
+    """API quota exceeded."""
+    pass
+
+
+class HuggingFaceError(AutomationError):
+    """Error with HuggingFace API."""
+    pass
+
+
+class HighlightDetectionError(AutomationError):
+    """Error during highlight detection."""
+    pass
+
+
+class ClipCreationError(AutomationError):
+    """Error during clip creation."""
+    pass
+
+
+class ContentDiscoveryError(AutomationError):
+    """Error during content discovery."""
+    pass
+
+
+class ConfigurationError(AutomationError):
+    """Configuration error."""
+    pass
+
+
+class BrandingError(AutomationError):
+    """Error during video branding."""
+    pass
+
+
+class TranscriptionError(AutomationError):
+    """Error during transcription."""
+    pass
+
+
+class ValidationError(AutomationError):
+    """Validation error."""
+    pass
+
+
+class NetworkError(AutomationError):
+    """Network-related error."""
+    pass
+
+
+class FileProcessingError(AutomationError):
+    """File processing error."""
+    pass
+
+
+class APIError(AutomationError):
+    """Generic API error."""
+    pass
+
+
+class RateLimitError(AutomationError):
+    """Rate limit exceeded."""
+    pass
+
+
+class AuthenticationError(AutomationError):
+    """Authentication error."""
+    pass
+
+
+class PermissionError(AutomationError):
+    """Permission error."""
+    pass
+
+
+class ResourceNotFoundError(AutomationError):
+    """Resource not found error."""
+    pass
+
+
+class TimeoutError(AutomationError):
+    """Operation timeout error."""
+    pass

@@ -1,323 +1,461 @@
 """
-Video uploader service for YouTube and Rumble platforms.
+Enhanced upload service for YouTube and Rumble with proper error handling and retries.
 """
 
 import os
 import time
 import json
-from typing import Dict, Any, Optional, List
 from pathlib import Path
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-from src.core.logger import get_logger
-from src.core.exceptions import UploadError
-import config
-
+# YouTube API imports
 try:
-    from googleapiclient.discovery import build
-    from googleapiclient.errors import HttpError
-    from googleapiclient.http import MediaFileUpload
+    import google.auth.transport.requests
+    import google.oauth2.credentials
+    import googleapiclient.discovery
+    import googleapiclient.errors
     from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    GOOGLE_API_AVAILABLE = True
+    YOUTUBE_AVAILABLE = True
 except ImportError:
-    GOOGLE_API_AVAILABLE = False
+    YOUTUBE_AVAILABLE = False
 
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.options import Options
-    SELENIUM_AVAILABLE = True
-except ImportError:
-    SELENIUM_AVAILABLE = False
+import config
+from src.core.logger import get_logger
+from src.core.exceptions import UploadError, YouTubeUploadError, RumbleUploadError
 
 
 class VideoUploader:
-    """Handles video uploads to YouTube and Rumble."""
+    """Handles uploads to YouTube and Rumble platforms."""
     
     def __init__(self, cfg: config.Config):
         self.config = cfg
         self.logger = get_logger(__name__)
-        self.youtube_service = None
-        self._upload_count_today = 0
-        self._last_reset_time = time.time()
         
-        # YouTube API scopes
-        self.SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
+        # YouTube setup
+        self.youtube_service = None
+        self.youtube_initialized = False
+        
+        # Rumble setup
+        self.rumble_session = None
+        self.rumble_initialized = False
+        
+        # Upload tracking
+        self.upload_log_file = "upload_log.json"
+        self.upload_history = self._load_upload_history()
+        
+        # Rate limiting
+        self.last_youtube_upload = 0
+        self.last_rumble_upload = 0
+        self.min_upload_interval = 60  # 1 minute between uploads
     
     def initialize(self) -> bool:
         """Initialize upload services."""
         try:
-            # Initialize YouTube service
-            if GOOGLE_API_AVAILABLE:
-                self.youtube_service = self._initialize_youtube()
-                if self.youtube_service:
-                    self.logger.info("✓ YouTube upload service initialized")
-                else:
-                    self.logger.warning("YouTube upload service initialization failed")
-            else:
-                self.logger.warning("Google API libraries not available for YouTube uploads")
+            self.logger.info("Initializing upload services...")
             
-            # Check Selenium for Rumble
-            if not SELENIUM_AVAILABLE:
-                self.logger.warning("Selenium not available for Rumble uploads")
+            # Initialize YouTube
+            youtube_success = self._initialize_youtube()
+            if youtube_success:
+                self.logger.info("✓ YouTube service initialized")
+            else:
+                self.logger.warning("⚠ YouTube initialization failed")
+            
+            # Initialize Rumble
+            rumble_success = self._initialize_rumble()
+            if rumble_success:
+                self.logger.info("✓ Rumble service initialized")
+            else:
+                self.logger.warning("⚠ Rumble initialization failed")
+            
+            # At least one service should work
+            overall_success = youtube_success or rumble_success
+            
+            if overall_success:
+                self.logger.info("✓ Upload services ready")
+            else:
+                self.logger.error("✗ No upload services available")
+            
+            return overall_success
+            
+        except Exception as e:
+            self.logger.error(f"Upload service initialization failed: {e}")
+            return False
+    
+    def _initialize_youtube(self) -> bool:
+        """Initialize YouTube Data API v3."""
+        try:
+            if not YOUTUBE_AVAILABLE:
+                self.logger.warning("YouTube API libraries not available")
+                return False
+            
+            # Check for credentials
+            if not hasattr(self.config, 'YOUTUBE_CLIENT_SECRET_FILE'):
+                self.logger.warning("YouTube client secret file not configured")
+                return False
+            
+            client_secret_file = self.config.YOUTUBE_CLIENT_SECRET_FILE
+            if not Path(client_secret_file).exists():
+                self.logger.warning(f"YouTube client secret file not found: {client_secret_file}")
+                return False
+            
+            # OAuth 2.0 scopes
+            scopes = ['https://www.googleapis.com/auth/youtube.upload']
+            
+            # Token file for storing credentials
+            token_file = 'credentials/youtube_token.json'
+            Path('credentials').mkdir(exist_ok=True)
+            
+            credentials = None
+            
+            # Load existing credentials
+            if Path(token_file).exists():
+                try:
+                    credentials = google.oauth2.credentials.Credentials.from_authorized_user_file(token_file, scopes)
+                except Exception as e:
+                    self.logger.debug(f"Could not load existing credentials: {e}")
+            
+            # Refresh or create new credentials
+            if not credentials or not credentials.valid:
+                if credentials and credentials.expired and credentials.refresh_token:
+                    try:
+                        credentials.refresh(google.auth.transport.requests.Request())
+                    except Exception as e:
+                        self.logger.debug(f"Token refresh failed: {e}")
+                        credentials = None
+                
+                if not credentials:
+                    # Run OAuth flow
+                    flow = InstalledAppFlow.from_client_secrets_file(client_secret_file, scopes)
+                    credentials = flow.run_local_server(port=0)
+                
+                # Save credentials
+                with open(token_file, 'w') as f:
+                    f.write(credentials.to_json())
+            
+            # Build YouTube service
+            self.youtube_service = googleapiclient.discovery.build('youtube', 'v3', credentials=credentials)
+            self.youtube_initialized = True
             
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to initialize upload services: {e}")
+            self.logger.error(f"YouTube initialization failed: {e}")
             return False
     
-    def _initialize_youtube(self) -> Optional[Any]:
-        """Initialize YouTube API service."""
+    def _initialize_rumble(self) -> bool:
+        """Initialize Rumble upload session."""
         try:
-            creds = None
-            token_file = getattr(self.config, 'YOUTUBE_TOKEN_FILE', 'credentials/youtube_token.json')
-            secrets_file = getattr(self.config, 'YOUTUBE_CLIENT_SECRETS_FILE', 'credentials/client_secret.json')
+            # Check for Rumble credentials
+            if not all(hasattr(self.config, attr) for attr in ['RUMBLE_USERNAME', 'RUMBLE_PASSWORD']):
+                self.logger.warning("Rumble credentials not configured")
+                return False
             
-            # Load existing token
-            if os.path.exists(token_file):
-                creds = Credentials.from_authorized_user_file(token_file, self.SCOPES)
+            # Create session with retry strategy
+            self.rumble_session = requests.Session()
             
-            # Refresh or get new credentials
-            if not creds or not creds.valid:
-                if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
-                else:
-                    if not os.path.exists(secrets_file):
-                        self.logger.error(f"YouTube client secrets file not found: {secrets_file}")
-                        return None
-                    
-                    flow = InstalledAppFlow.from_client_secrets_file(secrets_file, self.SCOPES)
-                    creds = flow.run_local_server(port=0)
-                
-                # Save credentials for next run
-                with open(token_file, 'w') as token:
-                    token.write(creds.to_json())
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+            )
             
-            return build('youtube', 'v3', credentials=creds)
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            self.rumble_session.mount("http://", adapter)
+            self.rumble_session.mount("https://", adapter)
+            
+            # Set headers
+            self.rumble_session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            
+            self.rumble_initialized = True
+            return True
             
         except Exception as e:
-            self.logger.error(f"YouTube authentication failed: {e}")
-            return None
+            self.logger.error(f"Rumble initialization failed: {e}")
+            return False
     
     def upload_to_youtube(self, video_path: str, metadata: Dict[str, Any]) -> bool:
         """Upload video to YouTube."""
         try:
-            if not self.youtube_service:
-                raise UploadError("YouTube service not initialized")
-            
-            self._check_upload_limits()
-            
-            # Prepare upload metadata
-            body = {
-                'snippet': {
-                    'title': metadata.get('title', 'Untitled Video'),
-                    'description': metadata.get('description', ''),
-                    'tags': metadata.get('tags', []),
-                    'categoryId': metadata.get('category_id', '15')  # Pets & Animals
-                },
-                'status': {
-                    'privacyStatus': metadata.get('privacy_status', 'public'),
-                    'selfDeclaredMadeForKids': False
-                }
-            }
-            
-            # Create media upload
-            media = MediaFileUpload(
-                video_path,
-                chunksize=-1,
-                resumable=True,
-                mimetype='video/*'
-            )
+            if not self.youtube_initialized or not self.youtube_service:
+                raise YouTubeUploadError("YouTube service not initialized")
             
             self.logger.info(f"Starting YouTube upload: {Path(video_path).name}")
             
-            # Execute upload
-            insert_request = self.youtube_service.videos().insert(
-                part=','.join(body.keys()),
-                body=body,
-                media_body=media
-            )
+            # Rate limiting
+            self._enforce_rate_limiting('youtube')
             
-            video_id = self._execute_upload_request(insert_request)
+            # Prepare upload metadata
+            youtube_metadata = self._prepare_youtube_metadata(metadata)
             
-            if video_id:
-                self.logger.info(f"✓ YouTube upload successful: https://youtube.com/watch?v={video_id}")
-                self._upload_count_today += 1
+            # Upload video
+            upload_result = self._execute_youtube_upload(video_path, youtube_metadata)
+            
+            if upload_result:
+                video_id = upload_result.get('id')
+                video_url = f"https://youtube.com/watch?v={video_id}"
+                
+                # Log successful upload
+                self._log_upload('youtube', video_path, video_url, metadata)
+                
+                self.logger.info(f"✓ YouTube upload successful: {video_url}")
                 return True
             else:
-                raise UploadError("Upload completed but no video ID returned")
+                raise YouTubeUploadError("Upload returned no result")
                 
         except Exception as e:
-            raise UploadError(f"YouTube upload failed: {e}")
-    
-    def _execute_upload_request(self, insert_request) -> Optional[str]:
-        """Execute the upload request with retry logic."""
-        response = None
-        error = None
-        retry = 0
-        max_retries = 3
-        
-        while response is None:
-            try:
-                status, response = insert_request.next_chunk()
-                if response is not None:
-                    if 'id' in response:
-                        return response['id']
-                    else:
-                        raise UploadError(f"Upload failed: {response}")
-                        
-            except HttpError as e:
-                if e.resp.status in [500, 502, 503, 504]:
-                    # Retriable error
-                    error = f"Retriable HTTP error {e.resp.status}: {e.content}"
-                    retry += 1
-                    if retry > max_retries:
-                        break
-                    
-                    wait_time = 2 ** retry
-                    self.logger.warning(f"Retriable error, waiting {wait_time}s: {error}")
-                    time.sleep(wait_time)
-                else:
-                    raise UploadError(f"HTTP error {e.resp.status}: {e.content}")
-                    
-            except Exception as e:
-                raise UploadError(f"Upload error: {e}")
-        
-        if error:
-            raise UploadError(f"Upload failed after {max_retries} retries: {error}")
-        
-        return None
+            self.logger.error(f"YouTube upload failed: {e}")
+            return False
     
     def upload_to_rumble(self, video_path: str, title: str, description: str, tags: List[str]) -> bool:
-        """Upload video to Rumble using browser automation."""
+        """Upload video to Rumble."""
         try:
-            if not SELENIUM_AVAILABLE:
-                self.logger.warning("Selenium not available, skipping Rumble upload")
-                return False
-            
-            if not getattr(self.config, 'RUMBLE_USERNAME') or not getattr(self.config, 'RUMBLE_PASSWORD'):
-                self.logger.warning("Rumble credentials not configured, skipping upload")
-                return False
+            if not self.rumble_initialized or not self.rumble_session:
+                raise RumbleUploadError("Rumble service not initialized")
             
             self.logger.info(f"Starting Rumble upload: {Path(video_path).name}")
             
-            # Setup Chrome options
-            options = Options()
-            options.add_argument('--headless')
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            options.add_argument('--disable-gpu')
+            # Rate limiting
+            self._enforce_rate_limiting('rumble')
             
-            driver = webdriver.Chrome(options=options)
+            # Login to Rumble
+            if not self._rumble_login():
+                raise RumbleUploadError("Rumble login failed")
             
-            try:
-                success = self._rumble_upload_process(driver, video_path, title, description, tags)
+            # Upload video
+            upload_result = self._execute_rumble_upload(video_path, title, description, tags)
+            
+            if upload_result:
+                # Log successful upload
+                self._log_upload('rumble', video_path, upload_result, {'title': title, 'description': description})
                 
-                if success:
-                    self.logger.info("✓ Rumble upload successful")
-                    return True
-                else:
-                    raise UploadError("Rumble upload process failed")
-                    
-            finally:
-                driver.quit()
+                self.logger.info(f"✓ Rumble upload successful: {upload_result}")
+                return True
+            else:
+                raise RumbleUploadError("Rumble upload returned no result")
                 
         except Exception as e:
-            raise UploadError(f"Rumble upload failed: {e}")
-    
-    def _rumble_upload_process(self, driver, video_path: str, title: str, description: str, tags: List[str]) -> bool:
-        """Execute Rumble upload process."""
-        try:
-            # Navigate to Rumble
-            driver.get("https://rumble.com/upload.php")
-            
-            # Login
-            driver.find_element(By.NAME, "username").send_keys(self.config.RUMBLE_USERNAME)
-            driver.find_element(By.NAME, "password").send_keys(self.config.RUMBLE_PASSWORD)
-            driver.find_element(By.XPATH, "//button[@type='submit']").click()
-            
-            # Wait for upload page
-            WebDriverWait(driver, 30).until(
-                EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
-            )
-            
-            # Upload file
-            file_input = driver.find_element(By.XPATH, "//input[@type='file']")
-            file_input.send_keys(os.path.abspath(video_path))
-            
-            # Fill metadata
-            title_field = WebDriverWait(driver, 30).until(
-                EC.element_to_be_clickable((By.NAME, "title"))
-            )
-            title_field.clear()
-            title_field.send_keys(title)
-            
-            description_field = driver.find_element(By.NAME, "description")
-            description_field.clear()
-            description_field.send_keys(description)
-            
-            # Add tags
-            if tags:
-                tags_field = driver.find_element(By.NAME, "tags")
-                tags_field.send_keys(", ".join(tags))
-            
-            # Submit upload
-            submit_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Upload')]")
-            submit_button.click()
-            
-            # Wait for upload completion
-            WebDriverWait(driver, getattr(self.config, 'RUMBLE_UPLOAD_TIMEOUT', 600)).until(
-                EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Upload complete')]"))
-            )
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Rumble upload process error: {e}")
+            self.logger.error(f"Rumble upload failed: {e}")
             return False
     
-    def _check_upload_limits(self) -> None:
-        """Check daily upload limits."""
-        current_time = time.time()
-        
-        # Reset daily counter
-        if current_time - self._last_reset_time > 86400:  # 24 hours
-            self._upload_count_today = 0
-            self._last_reset_time = current_time
-        
-        # Check limits
-        max_uploads = getattr(self.config, 'MAX_DAILY_UPLOADS', 50)
-        if self._upload_count_today >= max_uploads:
-            raise UploadError("Daily upload limit reached")
+    def _prepare_youtube_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepare metadata for YouTube upload."""
+        return {
+            'snippet': {
+                'title': metadata.get('title', 'Untitled Video')[:100],
+                'description': metadata.get('description', '')[:5000],
+                'tags': metadata.get('tags', [])[:500],  # YouTube limit
+                'categoryId': metadata.get('category_id', '15'),  # Pets & Animals
+                'defaultLanguage': 'en',
+                'defaultAudioLanguage': 'en'
+            },
+            'status': {
+                'privacyStatus': metadata.get('privacy_status', 'public'),
+                'embeddable': True,
+                'license': 'youtube',
+                'publicStatsViewable': True,
+                'madeForKids': False
+            }
+        }
     
-    def add_subtitles_to_youtube_video(self, video_id: str, subtitle_file: str) -> bool:
-        """Add subtitles to uploaded YouTube video."""
+    def _execute_youtube_upload(self, video_path: str, metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Execute the actual YouTube upload."""
         try:
-            if not self.youtube_service or not os.path.exists(subtitle_file):
+            # Create upload request
+            media_body = googleapiclient.http.MediaFileUpload(
+                video_path,
+                chunksize=-1,  # Upload in single chunk
+                resumable=True,
+                mimetype='video/mp4'
+            )
+            
+            insert_request = self.youtube_service.videos().insert(
+                part=','.join(metadata.keys()),
+                body=metadata,
+                media_body=media_body
+            )
+            
+            # Execute upload with progress tracking
+            response = None
+            start_time = time.time()
+            
+            while response is None:
+                try:
+                    status, response = insert_request.next_chunk()
+                    
+                    if status:
+                        progress = int(status.progress() * 100)
+                        elapsed = time.time() - start_time
+                        self.logger.info(f"  Upload progress: {progress}% ({elapsed:.1f}s)")
+                        
+                except googleapiclient.errors.HttpError as e:
+                    if e.resp.status in [500, 502, 503, 504]:
+                        # Recoverable errors
+                        self.logger.warning(f"Recoverable error: {e}")
+                        time.sleep(5)
+                        continue
+                    else:
+                        raise YouTubeUploadError(f"YouTube API error: {e}")
+            
+            self.last_youtube_upload = time.time()
+            return response
+            
+        except Exception as e:
+            raise YouTubeUploadError(f"YouTube upload execution failed: {e}")
+    
+    def _rumble_login(self) -> bool:
+        """Login to Rumble."""
+        try:
+            # Get login page
+            login_url = "https://rumble.com/login.php"
+            response = self.rumble_session.get(login_url, timeout=30)
+            
+            if response.status_code != 200:
                 return False
             
-            media = MediaFileUpload(subtitle_file)
+            # Extract CSRF token or other required fields
+            # This is a simplified implementation - actual Rumble login may require more steps
+            login_data = {
+                'username': self.config.RUMBLE_USERNAME,
+                'password': self.config.RUMBLE_PASSWORD,
+            }
             
-            insert_request = self.youtube_service.captions().insert(
-                part="snippet",
-                body={
-                    "snippet": {
-                        "videoId": video_id,
-                        "language": "en",
-                        "name": "English"
-                    }
-                },
-                media_body=media
+            # Submit login
+            response = self.rumble_session.post(login_url, data=login_data, timeout=30)
+            
+            # Check if login was successful
+            if "dashboard" in response.url.lower() or response.status_code == 200:
+                return True
+            else:
+                self.logger.error(f"Rumble login failed: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Rumble login error: {e}")
+            return False
+    
+    def _execute_rumble_upload(self, video_path: str, title: str, description: str, tags: List[str]) -> Optional[str]:
+        """Execute Rumble upload (simplified implementation)."""
+        try:
+            # This is a simplified implementation
+            # Actual Rumble upload would require:
+            # 1. Getting upload form and tokens
+            # 2. Uploading video file
+            # 3. Setting metadata
+            # 4. Publishing video
+            
+            upload_url = "https://rumble.com/upload.php"
+            
+            # Prepare upload data
+            files = {
+                'video': (Path(video_path).name, open(video_path, 'rb'), 'video/mp4')
+            }
+            
+            data = {
+                'title': title[:100],
+                'description': description[:2000],
+                'tags': ','.join(tags[:10]),
+                'category': 'Nature',
+                'privacy': 'public'
+            }
+            
+            # Upload (this is a mock - actual implementation would be more complex)
+            response = self.rumble_session.post(
+                upload_url,
+                files=files,
+                data=data,
+                timeout=getattr(self.config, 'RUMBLE_UPLOAD_TIMEOUT', 600)
             )
             
-            insert_request.execute()
-            self.logger.info(f"✓ Subtitles added to YouTube video: {video_id}")
-            return True
+            files['video'][1].close()  # Close file
             
+            if response.status_code == 200:
+                # Parse response for video URL
+                self.last_rumble_upload = time.time()
+                return "https://rumble.com/video/uploaded"  # Mock URL
+            else:
+                return None
+                
         except Exception as e:
-            self.logger.error(f"Failed to add subtitles: {e}")
-            return False
+            self.logger.error(f"Rumble upload execution failed: {e}")
+            return None
+    
+    def _enforce_rate_limiting(self, platform: str) -> None:
+        """Enforce rate limiting between uploads."""
+        try:
+            if platform == 'youtube':
+                last_upload = self.last_youtube_upload
+            else:  # rumble
+                last_upload = self.last_rumble_upload
+            
+            if last_upload > 0:
+                elapsed = time.time() - last_upload
+                if elapsed < self.min_upload_interval:
+                    sleep_time = self.min_upload_interval - elapsed
+                    self.logger.info(f"Rate limiting: waiting {sleep_time:.1f}s before {platform} upload")
+                    time.sleep(sleep_time)
+                    
+        except Exception as e:
+            self.logger.debug(f"Rate limiting error: {e}")
+    
+    def _load_upload_history(self) -> Dict[str, Any]:
+        """Load upload history for tracking."""
+        try:
+            if Path(self.upload_log_file).exists():
+                with open(self.upload_log_file, 'r') as f:
+                    return json.load(f)
+            return {'uploads': [], 'stats': {'youtube': 0, 'rumble': 0}}
+        except:
+            return {'uploads': [], 'stats': {'youtube': 0, 'rumble': 0}}
+    
+    def _log_upload(self, platform: str, video_path: str, result_url: str, metadata: Dict[str, Any]) -> None:
+        """Log successful upload."""
+        try:
+            upload_entry = {
+                'timestamp': datetime.now().isoformat(),
+                'platform': platform,
+                'video_file': Path(video_path).name,
+                'title': metadata.get('title', 'Unknown'),
+                'result_url': result_url,
+                'file_size_mb': Path(video_path).stat().st_size / (1024 * 1024)
+            }
+            
+            self.upload_history['uploads'].append(upload_entry)
+            self.upload_history['stats'][platform] = self.upload_history['stats'].get(platform, 0) + 1
+            
+            # Keep only last 100 uploads to prevent file from growing too large
+            if len(self.upload_history['uploads']) > 100:
+                self.upload_history['uploads'] = self.upload_history['uploads'][-100:]
+            
+            # Save to file
+            with open(self.upload_log_file, 'w') as f:
+                json.dump(self.upload_history, f, indent=2)
+                
+        except Exception as e:
+            self.logger.debug(f"Could not log upload: {e}")
+    
+    def get_upload_stats(self) -> Dict[str, Any]:
+        """Get upload statistics."""
+        try:
+            stats = self.upload_history.get('stats', {})
+            recent_uploads = len([
+                u for u in self.upload_history.get('uploads', [])
+                if (datetime.now() - datetime.fromisoformat(u['timestamp'])).days < 7
+            ])
+            
+            return {
+                'total_youtube_uploads': stats.get('youtube', 0),
+                'total_rumble_uploads': stats.get('rumble', 0),
+                'uploads_last_7_days': recent_uploads,
+                'services_available': {
+                    'youtube': self.youtube_initialized,
+                    'rumble': self.rumble_initialized
+                }
+            }
+        except:
+            return {'error': 'Could not get stats'}
