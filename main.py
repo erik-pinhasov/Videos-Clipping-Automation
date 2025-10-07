@@ -23,7 +23,7 @@ def signal_handler(sig, frame):
 
 def main():
     try:
-        print("🚀 YouTube Shorts Automation - CONTINUOUS MODE")
+        print("------------------ Starting Automation ------------------")
         signal.signal(signal.SIGINT, signal_handler)
 
         # Setup
@@ -91,18 +91,28 @@ def main():
                         wait_for_manual_fix()
 
 
-                # Step 4: Upload full video to Rumble
+                # Step 4: Upload full video to Rumble (optionally in background)
+                rumble_task_id = None
                 try:
-                    logger.info(f"   📤 Uploading full video to Rumble...")
-                    video_uploader.upload_to_rumble(
-                        branded_video_path,
-                        metadata['title'],
-                        metadata['description'],
-                        metadata['tags']
-                    )
+                    if getattr(cfg, 'RUMBLE_UPLOAD_ASYNC', True):
+                        logger.info(f"   📤 Starting Rumble upload in background...")
+                        rumble_task_id = video_uploader.start_rumble_upload_background(
+                            branded_video_path,
+                            metadata['title'],
+                            metadata['description'],
+                            metadata['tags']
+                        )
+                        logger.info(f"   🔁 Rumble task started: {rumble_task_id} (will continue processing in parallel)")
+                    else:
+                        logger.info(f"   📤 Uploading full video to Rumble synchronously...")
+                        video_uploader.upload_to_rumble(
+                            branded_video_path,
+                            metadata['title'],
+                            metadata['description'],
+                            metadata['tags']
+                        )
                 except Exception as e:
-                    logger.error(f"❌ Failed to upload to Rumble: {e}")
-                    wait_for_manual_fix()
+                    logger.error(f"❌ Failed to start Rumble upload: {e}")
                     # Continue to clip creation even if Rumble upload fails
 
                 # Step 5: Create clips from the branded video
@@ -129,35 +139,59 @@ def main():
                             logger.error(f"❌ Failed to upload clip to YouTube Shorts: {e}")
                             wait_for_manual_fix()
 
-                # Step 7: Mark original video used only if Rumble succeeded (best-effort) and all shorts uploaded
+                # Step 7: If Rumble was in background, report status now and consider failure
+                rumble_success = True
                 try:
-                    if uploaded_count == len(clips):
+                    if rumble_task_id:
+                        status = video_uploader.get_rumble_task_status(rumble_task_id)
+                        if status:
+                            logger.info(f"   📊 Rumble task status: {status['status']} (result={status.get('result_url')})")
+                            rumble_success = status['status'] == 'success'
+                except Exception as e:
+                    logger.debug(f"Could not read Rumble task status: {e}")
+
+                # Step 8: Mark original video used only if all shorts uploaded (and optionally Rumble ok)
+                try:
+                    overall_success = (uploaded_count == len(clips))
+                    if getattr(cfg, 'RUMBLE_UPLOAD_ASYNC', True):
+                        overall_success = overall_success and rumble_success
+                    if overall_success:
                         video_processor.content_manager.mark_video_used(video['url'])
                     else:
                         logger.warning(f"Only {uploaded_count}/{len(clips)} clips uploaded. Not marking source as used.")
                 except Exception as e:
                     logger.debug(f"Could not mark used_videos: {e}")
 
-                # Step 8: Optional cleanup: delete branded/full files if configured
+                # Step 9: Optional cleanup: delete branded/full files if configured and overall success only
                 try:
-                    if getattr(cfg, 'CLEANUP_DELETE_BRANDED', True):
-                        p = Path(branded_video_path)
-                        if p.exists():
-                            p.unlink()
-                            logger.info(f"🧹 Deleted branded file: {p.name}")
-                    if getattr(cfg, 'CLEANUP_DELETE_ORIGINAL_DOWNLOAD', True):
-                        p = Path(video_path)
-                        if p.exists():
-                            p.unlink()
-                            logger.info(f"🧹 Deleted original download: {p.name}")
+                    if 'overall_success' not in locals():
+                        overall_success = False
+                    if overall_success:
+                        if getattr(cfg, 'CLEANUP_DELETE_BRANDED', True):
+                            p = Path(branded_video_path)
+                            if p.exists():
+                                p.unlink()
+                                logger.info(f"🧹 Deleted branded file: {p.name}")
+                        if getattr(cfg, 'CLEANUP_DELETE_ORIGINAL_DOWNLOAD', True):
+                            p = Path(video_path)
+                            if p.exists():
+                                p.unlink()
+                                logger.info(f"🧹 Deleted original download: {p.name}")
+                    else:
+                        logger.info("Skipping cleanup because overall success = False.")
                 except Exception as e:
                     logger.debug(f"Cleanup failed: {e}")
 
-                logger.info(f"✅ Video processed successfully!")
+                if overall_success:
+                    logger.info(f"✅ Video processed successfully!")
+                else:
+                    logger.warning("⚠️ Video processing finished with errors. Stopping after this session.")
+                    break
 
             except Exception as e:
                 logger.error(f"❌ Failed to process video: {e}")
                 wait_for_manual_fix()
+                break
 
     except KeyboardInterrupt:
         print(f"\n🛑 Stopped after processing {processed_count} videos")

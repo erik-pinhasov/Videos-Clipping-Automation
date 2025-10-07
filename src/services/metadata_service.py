@@ -55,16 +55,15 @@ class MetadataService:
         """Generate viral-optimized metadata for video content."""
         try:
             self.logger.info("Generating AI metadata...")
-            
-            # Check daily usage limits
-            if self._check_usage_limits():
-                raise QuotaExceededError("Daily OpenAI usage limit reached")
-            
+
             # Get channel strategy
             strategy = self.channel_strategies.get(channel, self.channel_strategies['naturesmomentstv'])
             
             # Generate metadata using OpenAI
-            metadata = self._generate_with_openai(original_title, strategy, channel)
+            # Respect config: optionally ignore original title influence
+            use_orig = bool(getattr(self.config, 'METADATA_USE_ORIGINAL_TITLE', False))
+            orig_for_prompt = original_title if use_orig else None
+            metadata = self._generate_with_openai(orig_for_prompt, strategy, channel)
             
             # Track usage
             self._track_usage()
@@ -113,7 +112,7 @@ class MetadataService:
         except Exception as e:
             raise OpenAIError(f"OpenAI API call failed: {e}")
     
-    def _build_viral_prompt(self, original_title: str, strategy: Dict[str, Any], channel: str) -> str:
+    def _build_viral_prompt(self, original_title: Optional[str], strategy: Dict[str, Any], channel: str) -> str:
         """Build a prompt optimized for viral content generation."""
         
         focus = strategy['focus']
@@ -123,18 +122,19 @@ class MetadataService:
         prompt = f"""
 Create viral YouTube content metadata for a {focus} video.
 
-Original title: "{original_title or 'Nature/Wildlife Content'}"
+Original title (context only, do NOT reuse wording): "{original_title or 'Nature/Wildlife Content'}"
 Channel focus: {focus}
 Target emotions: {emotions}
 Power keywords to use: {keywords}
 
 Requirements:
-1. TITLE: Create a compelling 60-80 character title that:
+1. TITLE: Create a compelling 60-80 character NEW title that:
    - Removes ALL technical specs (4K, HD, 60fps, Ultra, etc.)
    - Uses emotional hooks and curiosity gaps
    - Includes power keywords: {keywords}
    - Evokes {emotions}
    - Is optimized for YouTube algorithm
+    - Do not copy or closely paraphrase the original title; create a fresh variant that still fits the video
 
 2. DESCRIPTION: Write a 150-200 word description that:
    - Opens with an emotional hook
@@ -269,11 +269,6 @@ Format your response as JSON:
                 'cost': 0.0
             }
     
-    def _check_usage_limits(self) -> bool:
-        """Check if daily usage limits are exceeded."""
-        daily_limit = getattr(self.config, 'OPENAI_DAILY_LIMIT', 100)
-        return self.daily_usage['count'] >= daily_limit
-    
     def _track_usage(self) -> None:
         """Track API usage for cost monitoring."""
         try:
@@ -289,9 +284,7 @@ Format your response as JSON:
     def enhance_subtitles(self, raw_transcript: str, channel: str) -> str:
         """Enhance raw transcript for engaging subtitles (OpenAI task)."""
         try:
-            if self._check_usage_limits():
-                return raw_transcript  # Return original if quota exceeded
-            
+
             strategy = self.channel_strategies.get(channel, self.channel_strategies['naturesmomentstv'])
             
             prompt = f"""

@@ -20,9 +20,6 @@ class Config:
         if not self.OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY is not set in the .env file")
 
-        # No Hugging Face token required anymore (we rely on OpenAI and local analysis)
-        self.HUGGING_FACE_TOKEN = os.getenv("HUGGING_FACE_TOKEN", None)
-
         self.YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
         if not self.YOUTUBE_API_KEY:
             raise ValueError("YOUTUBE_API_KEY is not set in the .env file")
@@ -48,26 +45,42 @@ class Config:
         self.SUBTITLES_MODE = os.getenv("SUBTITLES_MODE", "exact").lower()
         # Whisper model selection (e.g., whisper-1, gpt-4o-transcribe, etc.)
         self.WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
-        # Playwright settings
+        # Playwright and Rumble settings
         self.RUMBLE_UPLOAD_METHOD = os.getenv("RUMBLE_UPLOAD_METHOD", "playwright").lower()
+        # Run Rumble upload in background (async)
+        self.RUMBLE_UPLOAD_ASYNC = os.getenv("RUMBLE_UPLOAD_ASYNC", "true").lower() in ["1", "true", "yes"]
         self.PLAYWRIGHT_BROWSER = os.getenv("PLAYWRIGHT_BROWSER", "chromium").lower()
         self.PLAYWRIGHT_AUTO_INSTALL = os.getenv("PLAYWRIGHT_AUTO_INSTALL", "true").lower() in ["1", "true", "yes"]
         self.PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() in ["1", "true", "yes"]
         self.PLAYWRIGHT_SLOWMO_MS = int(os.getenv("PLAYWRIGHT_SLOWMO_MS", "0"))
-        self.RUMBLE_UPLOAD_TIMEOUT_MS = int(os.getenv("RUMBLE_UPLOAD_TIMEOUT_MS", str(60 * 60 * 1000)))
-
-        self.OPENAI_DAILY_LIMIT = 10000
-        self.HUGGING_FACE_DAILY_LIMIT = 5000
+        self.RUMBLE_UPLOAD_TIMEOUT_MS = int(os.getenv("RUMBLE_UPLOAD_TIMEOUT_MS", str(60 * 60 * 3 * 1000)))
 
         # YouTube settings
-        self.YOUTUBE_MADE_FOR_KIDS = os.getenv("YOUTUBE_MADE_FOR_KIDS", "false").lower() in ["1", "true", "yes"]
+        self.YOUTUBE_MADE_FOR_KIDS = os.getenv("YOUTUBE_MADE_FOR_KIDS", "true").lower() in ["1", "true", "yes"]
         self.YOUTUBE_FORCE_SHORTS_HASHTAG = os.getenv("YOUTUBE_FORCE_SHORTS_HASHTAG", "true").lower() in ["1", "true", "yes"]
+        self.YOUTUBE_MIN_UPLOAD_INTERVAL = int(os.getenv("YOUTUBE_MIN_UPLOAD_INTERVAL", "10"))
+        # YouTube retry behavior
+        self.YOUTUBE_UPLOAD_MAX_RETRIES = int(os.getenv("YOUTUBE_UPLOAD_MAX_RETRIES", "3"))
+        self.YOUTUBE_UPLOAD_RETRY_BACKOFF_BASE = float(os.getenv("YOUTUBE_UPLOAD_RETRY_BACKOFF_BASE", "2.0"))
         # Cleanup behavior
         self.DELETE_CLIP_AFTER_UPLOAD = os.getenv("DELETE_CLIP_AFTER_UPLOAD", "true").lower() in ["1", "true", "yes"]
         self.CLEANUP_DELETE_BRANDED = os.getenv("CLEANUP_DELETE_BRANDED", "true").lower() in ["1", "true", "yes"]
         self.CLEANUP_DELETE_ORIGINAL_DOWNLOAD = os.getenv("CLEANUP_DELETE_ORIGINAL_DOWNLOAD", "true").lower() in ["1", "true", "yes"]
+        # Download quality preferences
+        # Max target height for downloads (e.g., 2160 for 4K, 1440, 1080)
+        self.DOWNLOAD_MAX_HEIGHT = int(os.getenv("DOWNLOAD_MAX_HEIGHT", "2160"))
+        # Prefer AV1 when available, then VP9, then H.264
+        self.DOWNLOAD_PREFER_AV1 = os.getenv("DOWNLOAD_PREFER_AV1", "true").lower() in ["1", "true", "yes"]
+        # Merge container format for DASH downloads (mkv supports mixed codecs)
+        self.DOWNLOAD_MERGE_FORMAT = os.getenv("DOWNLOAD_MERGE_FORMAT", "mkv").lower()
 
-        # Channel-specific logo configurations
+        # Metadata/title generation
+        # If True, allow the original YouTube title to influence generated titles; if False, ignore it
+        self.METADATA_USE_ORIGINAL_TITLE = os.getenv("METADATA_USE_ORIGINAL_TITLE", "false").lower() in ["1", "true", "yes"]
+        # Safe fallback title when metadata generation misses
+        self.METADATA_FALLBACK_TITLE = os.getenv("METADATA_FALLBACK_TITLE", "Wildlife Highlight")
+
+    # Channel-specific logo configurations
         self.CHANNEL_LOGOS = {
             'naturesmomentstv': {
                 'logo_path': 'media/assets/naturesmomentstv.png',
@@ -117,9 +130,9 @@ class Config:
 
         # Video limits
         self.MAX_VIDEOS_TOTAL = 4
-        self.MIN_VIDEO_DURATION = 600  # 10 minutes
+        self.MIN_VIDEO_DURATION = 1800  # 30 minutes
         self.MAX_VIDEO_DURATION = 18000  # 5 hours
-        self.MAX_VIDEO_AGE_DAYS = 1500  # ~4 years
+        self.MAX_VIDEO_AGE_DAYS = 1800  # ~5 years
         
         print("✅ Config initialized successfully")
     

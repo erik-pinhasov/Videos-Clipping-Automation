@@ -3,8 +3,8 @@ Intelligent highlight detection using Hugging Face models and local analysis.
 """
 
 import os
+import tempfile
 import json
-import numpy as np
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
@@ -13,6 +13,19 @@ from datetime import datetime
 import config
 from src.core.logger import get_logger
 from src.core.exceptions import HighlightDetectionError
+from src.services.metadata_service import MetadataService
+_VOSK_AVAILABLE = False
+def _vosk_available() -> bool:
+    global _VOSK_AVAILABLE
+    if _VOSK_AVAILABLE:
+        return True
+    try:
+        import importlib
+        importlib.import_module('vosk')
+        _VOSK_AVAILABLE = True
+        return True
+    except Exception:
+        return False
 
 
 class HighlightDetector:
@@ -43,8 +56,16 @@ class HighlightDetector:
             if video_duration < 60:  # Too short
                 return []
             
-            # Use multiple detection methods
+            # Use multiple detection methods (AI captions first for quality, then local fallbacks)
             highlights = []
+
+            # AI path: get compact transcript and ask AI to select windows
+            try:
+                ai_highlights = self._detect_with_ai_transcript(video_path, channel, video_duration)
+                if ai_highlights:
+                    highlights.extend(ai_highlights)
+            except Exception as e:
+                self.logger.debug(f"AI transcript-based detection failed: {e}")
             
             # Method 1: Local audio analysis (free, unlimited)
             audio_highlights = self._detect_audio_peaks(video_path, strategy)
@@ -67,6 +88,170 @@ class HighlightDetector:
             self.logger.error(f"Highlight detection failed: {e}")
             # Return basic highlights as fallback
             return self._create_fallback_highlights(video_path)
+
+    def _detect_with_ai_transcript(self, video_path: str, channel: str, video_duration: float) -> List[Dict[str, Any]]:
+        """Token-efficient AI highlight selection using condensed transcript and niche-aware scoring.
+
+        Steps:
+        1) Extract a sparse transcript: prefer built-in captions via ffmpeg/yt-dlp if available; else sample ASR locally from 1–2% of frames/audio windows (cost-free), then condense with LLM.
+        2) Ask LLM to propose top highlight windows (10–55s), returning timestamps.
+        """
+        try:
+            # Step 1: Try embedded subtitles first (most token-efficient)
+            sparse_transcript = self._extract_embedded_captions(video_path)
+            if not sparse_transcript:
+                # Fallback: generate a very lightweight local "gist" transcript by sampling audio
+                sparse_transcript = self._sample_local_gist_transcript(video_path)
+
+            if not sparse_transcript:
+                return []
+
+            # Step 2: Condense transcript and request windows from OpenAI
+            ms = MetadataService(self.config)
+            strategy = self.detection_strategies.get(channel, 'nature_documentary')
+
+            prompt = f"""
+You are selecting the most engaging short highlight windows from a long {strategy} video (nature/wildlife).
+Given this sparse transcript (key lines only), output 8–20 candidate highlight segments.
+
+Rules:
+- Each segment must be between 10 and 55 seconds long.
+- Prefer emotionally engaging wildlife moments (hunts, interactions, reveals, funny/rare behavior) or epic scenic beats (panoramas, transitions).
+- Spread picks across the full timeline; avoid overlapping segments.
+- Return structured JSON only, as an array of objects: [{{"start": seconds, "end": seconds, "reason": "short reason"}}, ...]
+
+Sparse transcript (approximate timeline):
+{sparse_transcript}
+"""
+
+            resp = ms.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You choose time windows for viral short clips from nature/wildlife content strictly within given constraints."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=700,
+                temperature=0.4,
+            )
+
+            content = resp.choices[0].message.content.strip()
+            import json as _json
+            windows = []
+            try:
+                windows = _json.loads(content)
+            except Exception:
+                # Try to extract JSON from text
+                if '[' in content:
+                    content = content[content.index('['):]
+                    r = content.rfind(']')
+                    if r != -1:
+                        windows = _json.loads(content[:r+1])
+
+            results: List[Dict[str, Any]] = []
+            for w in windows:
+                try:
+                    s = max(0.0, float(w.get('start', 0.0)))
+                    e = min(video_duration - 1.0, float(w.get('end', 0.0)))
+                    if e > s and (e - s) >= 10 and (e - s) <= 55:
+                        results.append({
+                            'start': s,
+                            'end': e,
+                            'score': 0.9,
+                            'type': 'ai',
+                            'reason': w.get('reason', 'AI-selected highlight')[:80]
+                        })
+                except Exception:
+                    continue
+
+            return results[:40]
+        except Exception as e:
+            self.logger.debug(f"AI transcript selection error: {e}")
+            return []
+
+    def _extract_embedded_captions(self, video_path: str) -> str:
+        """Try to extract embedded subtitles/captions with ffmpeg (no tokens)."""
+        try:
+            # Dump first subtitle stream to srt if present
+            tmp_srt = Path(video_path).with_suffix('.captions.srt')
+            cmd = [
+                'ffmpeg', '-y', '-i', video_path,
+                '-map', '0:s:0', tmp_srt.as_posix()
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if res.returncode == 0 and tmp_srt.exists():
+                text = tmp_srt.read_text(encoding='utf-8', errors='ignore')
+                tmp_srt.unlink(missing_ok=True)
+                # Compress to a compact timeline string
+                return self._compact_srt(text)
+            return ""
+        except Exception:
+            return ""
+
+    def _sample_local_gist_transcript(self, video_path: str) -> str:
+        """Generate a very short gist of the audio by sampling sparse segments and running local ASR (no OpenAI)."""
+        try:
+            # Sample 6 short 8s windows spread across the video
+            dur = self._get_video_duration(video_path)
+            if dur <= 0:
+                return ""
+            stamps = [max(0, (i/6.0)*dur) for i in range(1,6)]
+            lines = []
+            for ts in stamps:
+                try:
+                    # Extract small audio chunk
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmpa:
+                        ap = tmpa.name
+                    cmd = ['ffmpeg', '-y', '-ss', str(ts), '-t', '8', '-i', video_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', ap]
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+                    if r.returncode != 0:
+                        continue
+                    # Use VOSK (if available) or leave markers only
+                    try:
+                        if not _vosk_available():
+                            raise RuntimeError("vosk not available")
+                        import wave, importlib
+                        wf = wave.open(ap, 'rb')
+                        vosk = importlib.import_module('vosk')  # type: ignore
+                        model = vosk.Model(lang='en-us')
+                        rec = vosk.KaldiRecognizer(model, wf.getframerate())
+                        text_accum = []
+                        while True:
+                            data = wf.readframes(4000)
+                            if len(data) == 0:
+                                break
+                            if rec.AcceptWaveform(data):
+                                text_accum.append(rec.Result())
+                        text_accum.append(rec.FinalResult())
+                        import json as _j
+                        words = ' '.join([_j.loads(x).get('text', '') for x in text_accum])
+                        if words.strip():
+                            lines.append(f"{int(ts)}s: {words.strip()}")
+                    except Exception:
+                        # If no vosk, record a timestamp marker instead to still guide spacing
+                        lines.append(f"{int(ts)}s: [audio sample]")
+                finally:
+                    try:
+                        os.unlink(ap)
+                    except Exception:
+                        pass
+            return '\n'.join(lines)
+        except Exception:
+            return ""
+
+    def _compact_srt(self, srt_text: str) -> str:
+        """Reduce SRT to a compact timeline text to keep tokens low."""
+        try:
+            out = []
+            for block in srt_text.split('\n\n'):
+                lines = [l.strip() for l in block.splitlines() if l.strip()]
+                if len(lines) >= 3:
+                    time_line = lines[1]
+                    text_line = ' '.join(lines[2:])
+                    out.append(f"{time_line} | {text_line}")
+            # Keep only first ~120 lines to cap tokens
+            return '\n'.join(out[:120])
+        except Exception:
+            return ""
     
     def _detect_audio_peaks(self, video_path: str, strategy: str) -> List[Dict[str, Any]]:
         """Detect audio-based highlights using local analysis."""
@@ -117,11 +302,13 @@ class HighlightDetector:
                 if 'pts_time:' in line:
                     try:
                         timestamp = float(line.split('pts_time:')[1].split()[0])
-                        
+                        # Use tighter windows around scene changes for short-form
+                        pre = 12.0
+                        post = 16.0
                         highlights.append({
-                            'start': max(0, timestamp - 30),  # 30s before peak
-                            'end': timestamp + 30,            # 30s after peak
-                            'score': 0.7,
+                            'start': max(0, timestamp - pre),
+                            'end': timestamp + post,
+                            'score': 0.75,
                             'type': 'motion',
                             'reason': 'Scene change detected'
                         })
@@ -220,7 +407,8 @@ class HighlightDetector:
             # If we don't have enough detected highlights, top up with evenly spaced fallbacks
             if len(valid_highlights) < desired_max:
                 needed = desired_max - len(valid_highlights)
-                fallback = self._generate_evenly_spaced_highlights(video_duration, length=55, stride=120)
+                # Prefer shorter fallback windows to keep clips punchy
+                fallback = self._generate_evenly_spaced_highlights(video_duration, length=28, stride=110)
 
                 # Avoid heavy overlap with existing highlights (>= 15s overlap)
                 def overlaps(a, b):
@@ -250,7 +438,7 @@ class HighlightDetector:
             self.logger.error(f"Highlight processing failed: {e}")
             return self._create_fallback_highlights_with_duration(video_duration)
 
-    def _generate_evenly_spaced_highlights(self, duration: float, length: int = 55, stride: int = 120) -> List[Dict[str, Any]]:
+    def _generate_evenly_spaced_highlights(self, duration: float, length: int = 28, stride: int = 110) -> List[Dict[str, Any]]:
         """Generate evenly spaced highlight windows across the video duration."""
         highlights = []
         if duration <= 0:
@@ -262,7 +450,7 @@ class HighlightDetector:
             highlights.append({
                 'start': t,
                 'end': t + length,
-                'score': 0.4,
+                'score': 0.45,
                 'type': 'fallback',
                 'reason': 'Evenly spaced fallback'
             })
@@ -308,7 +496,7 @@ class HighlightDetector:
         if duration < 120:  # Less than 2 minutes
             highlights.append({
                 'start': 10,
-                'end': min(duration - 5, 65),
+                'end': min(duration - 5, 28),
                 'score': 0.5,
                 'type': 'fallback',
                 'reason': 'Default highlight for short video'
@@ -318,14 +506,14 @@ class HighlightDetector:
             highlights.extend([
                 {
                     'start': 30,
-                    'end': 85,
+                    'end': 30 + 28,
                     'score': 0.6,
                     'type': 'fallback',
                     'reason': 'Early highlight'
                 },
                 {
                     'start': duration / 2,
-                    'end': duration / 2 + 55,
+                    'end': duration / 2 + 30,
                     'score': 0.6,
                     'type': 'fallback',
                     'reason': 'Mid-video highlight'
@@ -333,7 +521,7 @@ class HighlightDetector:
             ])
         else:  # 10+ minutes
             # Create many evenly spaced highlights (~every 2 minutes)
-            highlights = self._generate_evenly_spaced_highlights(duration, length=55, stride=120)
+            highlights = self._generate_evenly_spaced_highlights(duration, length=28, stride=110)
         
         return highlights
     

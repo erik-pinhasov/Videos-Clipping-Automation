@@ -20,40 +20,12 @@ class ClipCreator:
         # Ensure clips directory exists
         Path(self.config.CLIPS_DIR).mkdir(parents=True, exist_ok=True)
         
-        # Subtitle styling configurations
+        # Viral subtitle styling (consistent professional look)
         self.subtitle_styles = {
-            'naturesmomentstv': {
-                'font': 'Arial Bold',
-                'size': 24,
-                'color': 'white',
-                'outline_color': 'black',
-                'outline_width': 2,
-                'position': 'bottom'
-            },
-            'navwildanimaldocumentary': {
-                'font': 'Arial Bold',
-                'size': 26,
-                'color': '#FFD700',  # Gold
-                'outline_color': 'black',
-                'outline_width': 3,
-                'position': 'bottom'
-            },
-            'wildnatureus2024': {
-                'font': 'Arial Bold',
-                'size': 24,
-                'color': '#00FF7F',  # Spring green
-                'outline_color': '#006400',  # Dark green
-                'outline_width': 2,
-                'position': 'bottom'
-            },
-            'ScenicScenes': {
-                'font': 'Arial Bold',
-                'size': 22,
-                'color': '#E6E6FA',  # Lavender
-                'outline_color': '#4B0082',  # Indigo
-                'outline_width': 2,
-                'position': 'bottom'
-            }
+            'naturesmomentstv': { 'font': 'Arial', 'size': 52, 'color': 'white', 'outline_color': 'black', 'outline_width': 6, 'bold': 1, 'shadow': 0, 'spacing': 0, 'margin_v': 110, 'position': 'bottom' },
+            'navwildanimaldocumentary': { 'font': 'Arial', 'size': 52, 'color': 'white', 'outline_color': 'black', 'outline_width': 6, 'bold': 1, 'shadow': 0, 'spacing': 0, 'margin_v': 110, 'position': 'bottom' },
+            'wildnatureus2024': { 'font': 'Arial', 'size': 52, 'color': 'white', 'outline_color': 'black', 'outline_width': 6, 'bold': 1, 'shadow': 0, 'spacing': 0, 'margin_v': 110, 'position': 'bottom' },
+            'ScenicScenes': { 'font': 'Arial', 'size': 52, 'color': 'white', 'outline_color': 'black', 'outline_width': 6, 'bold': 1, 'shadow': 0, 'spacing': 0, 'margin_v': 110, 'position': 'bottom' }
         }
         
     # OpenAI API for speech-to-text
@@ -118,25 +90,27 @@ class ClipCreator:
             end_time = highlight['end']
             duration = end_time - start_time
             
-            # Ensure optimal duration for Shorts (45-60 seconds)
-            if duration > 60:
-                end_time = start_time + 58
-            elif duration < 30:
-                # Extend clip if too short
-                extension_needed = 35 - duration
-                start_time = max(0, start_time - extension_needed/2)
-                end_time = end_time + extension_needed/2
+            # Clamp duration to YouTube Shorts requirements: 10s–55s
+            min_len, max_len = 10, 55
+            if duration > max_len:
+                mid = (start_time + end_time) / 2.0
+                start_time = max(0, mid - max_len/2.0)
+                end_time = start_time + max_len
+            elif duration < min_len:
+                extend = min_len - duration
+                start_time = max(0, start_time - extend/2.0)
+                end_time = start_time + min_len
             
             # Output path
             clip_filename = f"{video_id}_clip_{clip_number}.mp4"
             clip_path = os.path.join(self.config.CLIPS_DIR, clip_filename)
             
-            # Create clip with optimal settings for Shorts and convert to 9:16 with blurred background
-            # Pipeline: scale original to fit height 1920, crop/pad to 1080x1920 with blurred background
+            # 9:16 layout: blurred background + foreground filling frame (no tiny center box)
             vf = (
-                "[0:v]scale=-2:1920:flags=lanczos,boxblur=luma_radius=20:luma_power=1:chroma_radius=20:chroma_power=1[bg];"
-                "[0:v]scale=1080:-2:flags=lanczos,setsar=1[fg];"
-                "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p"
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+                "boxblur=luma_radius=25:luma_power=1:chroma_radius=25:chroma_power=1[bg];"
+                "[0:v]scale=-2:1920:flags=lanczos,crop=1080:1920[fg];"
+                "[bg][fg]overlay=0:0,format=yuv420p"
             )
             cmd = [
                 'ffmpeg', '-y',
@@ -147,8 +121,8 @@ class ClipCreator:
                 '-r', '30',
                 '-s', '1080x1920',
                 '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', '23',  # Good quality for mobile viewing
+                '-preset', 'slow',
+                '-crf', '21',
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-movflags', '+faststart',  # Optimize for streaming
@@ -367,11 +341,33 @@ class ClipCreator:
             
             segments = transcript.get('segments', [])
             
+            # Helper to wrap and style text for viral readability
+            def wrap_text(text: str, max_chars: int = 28) -> str:
+                words = text.split()
+                lines = []
+                line = ''
+                for w in words:
+                    candidate = (line + ' ' + w).strip()
+                    if len(candidate) <= max_chars:
+                        line = candidate
+                    else:
+                        if line:
+                            lines.append(line)
+                        line = w
+                if line:
+                    lines.append(line)
+                if len(lines) > 2:
+                    lines = [lines[0], ' '.join(lines[1:])]
+                return '\n'.join(lines)
+
             with open(srt_path, 'w', encoding='utf-8') as f:
                 for i, segment in enumerate(segments):
                     start_time = self._seconds_to_srt_time(segment['start'])
                     end_time = self._seconds_to_srt_time(segment['end'])
                     text = segment['text'].strip()
+                    if getattr(self.config, 'SUBTITLES_MODE', 'exact') != 'off':
+                        text = text.upper()
+                    text = wrap_text(text)
                     
                     if text:  # Only write non-empty segments
                         f.write(f"{i + 1}\n")
@@ -402,8 +398,8 @@ class ClipCreator:
                 '-i', clip_path,
                 '-vf', subtitle_filter,
                 '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', '23',
+                '-preset', 'slow',
+                '-crf', '21',
                 '-c:a', 'copy',  # Copy audio without re-encoding
                 '-movflags', '+faststart',
                 output_path
@@ -444,6 +440,14 @@ class ClipCreator:
             if style.get('outline_color') and style.get('outline_width'):
                 kv.append(f"OutlineColour={self._convert_color_for_subtitles(style['outline_color'])}")
                 kv.append(f"Outline={style['outline_width']}")
+            if style.get('bold') is not None:
+                kv.append(f"Bold={style['bold']}")
+            if style.get('shadow') is not None:
+                kv.append(f"Shadow={style['shadow']}")
+            if style.get('spacing') is not None:
+                kv.append(f"Spacing={style['spacing']}")
+            if style.get('margin_v') is not None:
+                kv.append(f"MarginV={style['margin_v']}")
             if style.get('position') == 'bottom':
                 kv.append("Alignment=2")  # Bottom center
 

@@ -58,9 +58,8 @@ class ContentManager:
             except Exception as e:
                 self.logger.error(f"    ❌ Failed {channel_name}: {e}")
                 continue
-        
-        # Sort by upload date (newest first)
-        all_videos.sort(key=lambda x: x.get('upload_date', ''), reverse=True)
+        # Sort by upload date (newest first); coerce None to '' to avoid TypeError
+        all_videos.sort(key=lambda x: (x.get('upload_date') or ''), reverse=True)
         
         self.logger.info(f"🎯 Total videos selected: {len(all_videos)} (1 per channel)")
         return all_videos  # Return 1 video per channel (max 4 total)
@@ -68,12 +67,12 @@ class ContentManager:
     def _get_real_videos(self, channel_url: str, channel_name: str, used_videos: set) -> List[Dict[str, Any]]:
         """Get REAL videos using yt-dlp."""
         
+        # First pass: use extract_flat to list recent entries quickly and avoid format probing errors
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'extract_flat': False,  # Get full info
-            'playlistend': 20,      # Check last 20 videos
-            'daterange': yt_dlp.DateRange(end=None, start=None),
+            'extract_flat': True,   # Only lightweight metadata in channel listing
+            'playlistend': 20,      # Check last 20
             'ignoreerrors': True,
         }
         
@@ -108,16 +107,18 @@ class ContentManager:
                         break
                     
                     try:
-                        # Get video details
+                        # Get basic video details from flat entry
                         video_id = entry.get('id')
                         title = entry.get('title', 'Untitled')
-                        duration = entry.get('duration', 0)
-                        upload_date = entry.get('upload_date')
-                        view_count = entry.get('view_count', 0)
+                        upload_date = entry.get('upload_date') or entry.get('release_date')
+                        duration = entry.get('duration') or 0
+                        view_count = entry.get('view_count') or 0
                         
                         self.logger.info(f"      📹 Video: {title[:50]}...")
                         self.logger.info(f"          ID: {video_id}")
-                        self.logger.info(f"          Duration: {duration}s ({duration//60}:{duration%60:02d})")
+                        # Ensure proper integer formatting for minutes:seconds
+                        _dur_i = int(duration) if duration is not None else 0
+                        self.logger.info(f"          Duration: {_dur_i}s ({_dur_i//60}:{_dur_i%60:02d})")
                         self.logger.info(f"          Upload: {upload_date}")
                         self.logger.info(f"          Views: {view_count:,}")
                         
@@ -159,6 +160,18 @@ class ContentManager:
                             self.logger.info(f"      ❌ SKIP: Contains '{found_skip_term}'")
                             continue
                         
+                        # Second pass: fetch full metadata for the chosen video (no download)
+                        try:
+                            video_url_full = video_url
+                            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl2:
+                                full = ydl2.extract_info(video_url_full, download=False)
+                                duration = full.get('duration', duration)
+                                upload_date = full.get('upload_date', upload_date)
+                                view_count = full.get('view_count', view_count)
+                                title = full.get('title', title)
+                        except Exception as fetch_err:
+                            self.logger.debug(f"      ⚠️ Could not fetch full metadata: {fetch_err}")
+
                         # This is a good video!
                         video_info = {
                             'id': video_id,
@@ -168,7 +181,7 @@ class ContentManager:
                             'duration': duration,
                             'upload_date': upload_date,
                             'view_count': view_count,
-                            'duration_str': f"{duration//60}:{duration%60:02d}"
+                            'duration_str': f"{int(duration)//60}:{int(duration)%60:02d}"
                         }
                         
                         videos.append(video_info)

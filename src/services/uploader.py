@@ -1,9 +1,9 @@
-import os
 import time
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime
+import threading
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -46,7 +46,18 @@ class VideoUploader:
         # Rate limiting
         self.last_youtube_upload = 0
         self.last_rumble_upload = 0
-        self.min_upload_interval = 60  # 1 minute between uploads
+        # Minimum seconds between uploads; configurable
+        self.min_upload_interval = int(getattr(self.config, 'YOUTUBE_MIN_UPLOAD_INTERVAL', 10))
+        # YouTube retry config
+        self.youtube_max_retries = int(getattr(self.config, 'YOUTUBE_UPLOAD_MAX_RETRIES', 3))
+        self.youtube_retry_backoff_base = float(getattr(self.config, 'YOUTUBE_UPLOAD_RETRY_BACKOFF_BASE', 2.0))
+        
+        # Background task tracking (Rumble)
+        self._rumble_tasks = {}
+        self._rumble_task_counter = 0
+        self._rumble_tasks_lock = threading.Lock()
+        # Quota tracking
+        self.youtube_quota_exceeded = False
     
     def initialize(self) -> bool:
         """Initialize upload services."""
@@ -180,248 +191,279 @@ class VideoUploader:
         try:
             if not self.youtube_initialized or not self.youtube_service:
                 raise YouTubeUploadError("YouTube service not initialized")
-            
-            self.logger.info(f"Starting YouTube upload: {Path(video_path).name}")
-            
-            # Rate limiting
-            self._enforce_rate_limiting('youtube')
-            
-            # Prepare upload metadata
-            youtube_metadata = self._prepare_youtube_metadata(metadata, video_path)
-            
-            # Upload video
-            upload_result = self._execute_youtube_upload(video_path, youtube_metadata)
-            
-            if upload_result:
-                video_id = upload_result.get('id')
-                video_url = f"https://youtube.com/watch?v={video_id}"
-                
-                # Log successful upload
-                self._log_upload('youtube', video_path, video_url, metadata)
-                
-                # Optional delete clip after successful upload
+            if self.youtube_quota_exceeded:
+                self.logger.warning("Skipping YouTube upload: quota already exceeded this session.")
+                return False
+
+            attempts = max(1, self.youtube_max_retries)
+            for attempt in range(1, attempts + 1):
                 try:
-                    if getattr(self.config, 'DELETE_CLIP_AFTER_UPLOAD', True):
-                        p = Path(video_path)
-                        if p.exists():
-                            p.unlink()
-                            self.logger.info(f"Deleted uploaded clip: {p.name}")
-                except Exception as del_err:
-                    self.logger.debug(f"Could not delete clip after upload: {del_err}")
-                
-                self.logger.info(f"✓ YouTube upload successful: {video_url}")
-                return True
-            else:
-                raise YouTubeUploadError("Upload returned no result")
-                
+                    self.logger.info(f"Starting YouTube upload (attempt {attempt}/{attempts}): {Path(video_path).name}")
+
+                    # Rate limiting
+                    self._enforce_rate_limiting('youtube')
+
+                    # Prepare upload metadata
+                    youtube_metadata = self._prepare_youtube_metadata(metadata, video_path)
+
+                    # Upload video
+                    upload_result = self._execute_youtube_upload(video_path, youtube_metadata)
+
+                    if upload_result:
+                        video_id = upload_result.get('id')
+                        video_url = f"https://youtube.com/watch?v={video_id}"
+
+                        # Log successful upload
+                        self._log_upload('youtube', video_path, video_url, metadata)
+
+                        # Optional delete clip after successful upload
+                        try:
+                            if getattr(self.config, 'DELETE_CLIP_AFTER_UPLOAD', True):
+                                p = Path(video_path)
+                                if p.exists():
+                                    p.unlink()
+                                    self.logger.info(f"Deleted uploaded clip: {p.name}")
+                        except Exception as del_err:
+                            self.logger.debug(f"Could not delete clip after upload: {del_err}")
+
+                        self.logger.info(f"✓ YouTube upload successful: {video_url}")
+                        return True
+                    else:
+                        raise YouTubeUploadError("Upload returned no result")
+
+                except Exception as e:
+                    # Log and retry if attempts remain
+                    msg = str(e)
+                    # Stop immediately on quota exceeded
+                    if ('quota' in msg.lower()) or ('quotaExceeded' in msg) or ('403' in msg and 'quota' in msg.lower()):
+                        self.youtube_quota_exceeded = True
+                        self.logger.error(f"YouTube quota exceeded. Aborting further uploads this session.")
+                        return False
+                    if attempt < attempts:
+                        wait_s = min(60.0, (self.youtube_retry_backoff_base ** (attempt - 1)) * 5.0)
+                        self.logger.warning(f"YouTube upload attempt {attempt} failed: {e}. Retrying in {wait_s:.1f}s...")
+                        time.sleep(wait_s)
+                    else:
+                        raise
+
         except Exception as e:
             self.logger.error(f"YouTube upload failed: {e}")
             return False
-    
+
     def upload_to_rumble(self, video_path: str, title: str, description: str, tags: List[str]) -> bool:
-        """Upload video to Rumble."""
+        """Upload video to Rumble synchronously and return the resulting URL if detected."""
+        if not self.rumble_initialized or not self.rumble_session:
+            raise RumbleUploadError("Rumble service not initialized")
+
+        self.logger.info(f"Starting Rumble upload: {Path(video_path).name}")
+        self._enforce_rate_limiting('rumble')
+        
         try:
-            if not self.rumble_initialized or not self.rumble_session:
-                raise RumbleUploadError("Rumble service not initialized")
-            
-            self.logger.info(f"Starting Rumble upload: {Path(video_path).name}")
-            
-            # Rate limiting
-            self._enforce_rate_limiting('rumble')
-            
-            # Prefer Playwright automation when available
-            use_playwright = getattr(self.config, 'RUMBLE_UPLOAD_METHOD', 'playwright') == 'playwright'
-            if use_playwright:
-                try:
-                    self.logger.info("Using Playwright for Rumble upload")
-                    upload_result = self._upload_to_rumble_via_playwright(video_path, title, description, tags)
-                except Exception as e:
-                    self.logger.warning(f"Playwright path failed: {e}. Falling back to requests flow.")
-                    upload_result = None
-            else:
-                upload_result = None
-            
-            # Fallback to legacy requests flow if Playwright not used or failed
-            if not upload_result:
-                # Login to Rumble
-                if not self._rumble_login():
-                    raise RumbleUploadError("Rumble login failed")
-                upload_result = self._execute_rumble_upload(video_path, title, description, tags)
-            
-            if upload_result:
-                # Log successful upload
-                self._log_upload('rumble', video_path, upload_result, {'title': title, 'description': description})
-                
-                self.logger.info(f"✓ Rumble upload successful: {upload_result}")
-                return True
-            else:
-                raise RumbleUploadError("Rumble upload returned no result")
-                
+            self.logger.info("Using Playwright for Rumble upload")
+            upload_result = self._upload_to_rumble_via_playwright(video_path, title, description, tags)
         except Exception as e:
-            self.logger.error(f"Rumble upload failed: {e}")
+            self.logger.warning(f"Playwright path failed: {e}. Falling back to requests flow.")
+            upload_result = False
+
+        self.logger.info(f"Rumble upload completed with URL: {upload_result}")
+        return upload_result
+
+    def start_rumble_upload_background(self, video_path: str, title: str, description: str, tags: List[str]) -> str:
+        """Start Rumble upload in a background thread and return a task id."""
+        with self._rumble_tasks_lock:
+            self._rumble_task_counter += 1
+            task_id = f"rumble-{self._rumble_task_counter}"
+            self._rumble_tasks[task_id] = {
+                'id': task_id,
+                'status': 'running',
+                'video': Path(video_path).name,
+                'result_url': None,
+                'error': None,
+                'started_at': datetime.now().isoformat(),
+                'finished_at': None,
+            }
+
+        def _worker():
+            try:
+                url = self.upload_rumble_and_get_url(video_path, title, description, tags)
+                with self._rumble_tasks_lock:
+                    self._rumble_tasks[task_id]['status'] = 'success' if url else 'failed'
+                    self._rumble_tasks[task_id]['result_url'] = url
+                    self._rumble_tasks[task_id]['finished_at'] = datetime.now().isoformat()
+            except Exception as e:
+                with self._rumble_tasks_lock:
+                    self._rumble_tasks[task_id]['status'] = 'failed'
+                    self._rumble_tasks[task_id]['error'] = str(e)
+                    self._rumble_tasks[task_id]['finished_at'] = datetime.now().isoformat()
+
+        t = threading.Thread(target=_worker, name=f"RumbleUpload-{task_id}", daemon=True)
+        t.start()
+        self.logger.info(f"Started background Rumble upload task: {task_id}")
+        return task_id
+
+    def get_rumble_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Get current status of a background Rumble upload task."""
+        with self._rumble_tasks_lock:
+            return dict(self._rumble_tasks.get(task_id)) if task_id in self._rumble_tasks else None
+
+    def _upload_to_rumble_via_playwright(self, video_path: str, title: str, description: str, tags: List[str]) -> bool:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.logger.warning("Playwright is not installed. Run: pip install playwright && playwright install chromium")
             return False
 
-    def _upload_to_rumble_via_playwright(self, video_path: str, title: str, description: str, tags: List[str]) -> Optional[str]:
-        """Automate Rumble upload using Playwright (real browser flow). Returns video URL if detected."""
-        try:
+        rumble_user = getattr(self.config, 'RUMBLE_USERNAME', None)
+        rumble_pass = getattr(self.config, 'RUMBLE_PASSWORD', None)
+        
+        if not rumble_user or not rumble_pass:
+            self.logger.error("Rumble credentials missing in config")
+            return False
+
+        headless = bool(getattr(self.config, 'PLAYWRIGHT_HEADLESS', True))
+        slow_mo = int(getattr(self.config, 'PLAYWRIGHT_SLOWMO_MS', 0))
+        
+        with sync_playwright() as p:
+            # Launch browser
             try:
-                from playwright.sync_api import sync_playwright, TimeoutError as PwTimeoutError
-            except ImportError:
-                self.logger.warning("Playwright is not installed. Run: pip install playwright && playwright install chromium")
-                return None
+                browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
+            except Exception as e:
+                self.logger.error(f"Failed to launch browser: {e}")
+                return False
+                
+            context = browser.new_context()
+            page = context.new_page()
 
-            rumble_user = getattr(self.config, 'RUMBLE_USERNAME', None)
-            rumble_pass = getattr(self.config, 'RUMBLE_PASSWORD', None)
-            if not rumble_user or not rumble_pass:
-                self.logger.error("Rumble credentials missing in config")
-                return None
-
-            headless = bool(getattr(self.config, 'PLAYWRIGHT_HEADLESS', False))
-            slow_mo = int(getattr(self.config, 'PLAYWRIGHT_SLOWMO_MS', 0))
-            upload_timeout_ms = int(getattr(self.config, 'RUMBLE_UPLOAD_TIMEOUT_MS', 60 * 60 * 1000))  # default 60 min
-
-            self.logger.info(f"Launching Chromium (headless={headless}) for Rumble upload...")
-            with sync_playwright() as p:
-                # Attempt launch, and auto-install browser if configured and missing
-                try:
-                    browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
-                except Exception as launch_err:
-                    msg = str(launch_err)
-                    if "Executable doesn't exist" in msg or "was just installed or updated" in msg:
-                        if getattr(self.config, 'PLAYWRIGHT_AUTO_INSTALL', True):
-                            self.logger.info("Playwright browser missing. Attempting to install Chromium...")
-                            try:
-                                import subprocess
-                                subprocess.run(["playwright", "install", "chromium"], check=True)
-                                self.logger.info("Chromium installed. Retrying launch...")
-                                browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
-                            except Exception as install_err:
-                                self.logger.error(f"Could not auto-install Chromium: {install_err}")
-                                self.logger.error("Please run: playwright install chromium")
-                                return None
-                        else:
-                            self.logger.error("Playwright browser not installed. Set PLAYWRIGHT_AUTO_INSTALL=true or run: playwright install chromium")
-                            return None
-                    else:
-                        self.logger.error(f"Chromium launch failed: {launch_err}")
-                        return None
-                context = browser.new_context()
-                page = context.new_page()
-
-                # Login
-                page.goto("https://rumble.com/login.php", timeout=60000)
-                self.logger.info("Filling login form...")
+            try:
+                # Step 1: Login
+                self.logger.info("Logging in to Rumble...")
+                page.goto("https://rumble.com/login.php", wait_until='load')
                 page.fill('input[name="username"]', rumble_user)
                 page.fill('input[name="password"]', rumble_pass)
-                # Try submit
-                # Many forms use button[type=submit]
-                try:
-                    page.click('button[type="submit"]', timeout=5000)
-                except Exception:
-                    page.press('input[name="password"]', 'Enter')
+                time.sleep(1)
+                page.click('button[type="submit"]')
 
-                # Wait for navigation/login success
-                page.wait_for_url("**/", timeout=60000)
-                self.logger.info("Logged in to Rumble.")
+                page.goto("https://rumble.com/upload.php", wait_until='load')
+                page.set_input_files('#Filedata', video_path)
+                time.sleep(1)
+                
+                page.fill('input[name="title"]', title[:100])
+                page.fill('textarea[name="description"]', description[:2000])
+                page.fill('input[name="tags"]', ','.join(tags[:10]))
+                
+                cat_input = page.locator('input[name="primary-category"]').first
+                if cat_input.is_visible():
+                    cat_input.click()
+                    cat_input.fill('Entertainment')
+                    page.keyboard.press('Enter')
+                        
+                cat_input = page.locator('input[name="secondary-category"]').first
+                if cat_input.is_visible():
+                    cat_input.click()
+                    cat_input.fill('Wild Wildlife')
+                    page.keyboard.press('Enter')
 
-                # Navigate to upload page
-                page.goto("https://rumble.com/upload.php", timeout=60000)
-                page.wait_for_load_state('domcontentloaded')
-                self.logger.info("On upload page. Setting file input...")
-
-                # Try multiple selectors for file input
-                file_selectors = [
-                    'input[type="file"]',
-                    'input[name="video"]',
-                    'input#video',
-                ]
-                set_file_ok = False
-                for sel in file_selectors:
+                # Wait for video upload to complete (100%)
+                self.logger.info("Waiting for video upload to complete...")
+                upload_complete = False
+                for _ in range(720):  # Wait up to 60 minutes for upload
                     try:
-                        page.set_input_files(sel, video_path, timeout=10000)
-                        self.logger.info(f"File selected via selector: {sel}")
-                        set_file_ok = True
-                        break
+                        percent_element = page.locator('h2.num_percent')
+                        if percent_element.is_visible():
+                            percent_text = percent_element.text_content()
+                            if percent_text and "100%" in percent_text:
+                                self.logger.info("Video upload completed (100%)")
+                                upload_complete = True
+                                break
+                                
                     except Exception as e:
-                        self.logger.debug(f"File selector failed for {sel}: {e}")
-
-                if not set_file_ok:
-                    self.logger.error("Could not locate file input on Rumble upload page.")
-                    return None
-
-                # Fill metadata fields (best-effort)
-                try:
-                    page.fill('input[name="title"]', title[:100])
-                except Exception as e:
-                    self.logger.debug(f"Title fill skipped: {e}")
-                try:
-                    page.fill('textarea[name="description"]', description[:2000])
-                except Exception as e:
-                    self.logger.debug(f"Description fill skipped: {e}")
-                try:
-                    page.fill('input[name="tags"]', ','.join(tags[:10]))
-                except Exception as e:
-                    self.logger.debug(f"Tags fill skipped: {e}")
-
-                # Start upload/publish
-                self.logger.info("Submitting upload (searching for Upload/Publish button)...")
-                click_selectors = [
-                    'button:has-text("Upload")',
-                    'button:has-text("Publish")',
-                    'input[type="submit"]',
-                    'button[name="upload"]',
-                ]
-                clicked = False
-                for sel in click_selectors:
-                    try:
-                        page.click(sel, timeout=5000)
-                        self.logger.info(f"Clicked button via selector: {sel}")
-                        clicked = True
-                        break
-                    except Exception as e:
-                        self.logger.debug(f"Click selector failed for {sel}: {e}")
-                if not clicked:
-                    self.logger.warning("Could not find explicit Upload/Publish button. Assuming auto-start.")
-
-                # Wait for upload to complete. This can be long for large files.
-                self.logger.info("Waiting for upload to complete (this may take a long time)...")
-                deadline = time.time() + (upload_timeout_ms / 1000)
-                video_url = None
-
-                while time.time() < deadline:
-                    try:
-                        # Heuristic 1: URL changes to video page
-                        current_url = page.url
-                        if "/video/" in current_url:
-                            video_url = current_url
-                            self.logger.info(f"Detected video page URL: {video_url}")
-                            break
-                        # Heuristic 2: success text appears
-                        if page.locator("text=/uploaded|processing|success/i").first.is_visible():
-                            self.logger.info("Detected success/progress text on page.")
-                    except Exception:
+                        self.logger.debug(f"Upload progress check error: {e}")
                         pass
+                    
                     time.sleep(5)
-
-                if not video_url:
-                    self.logger.warning("Upload may still be processing. Could not confirm final video URL within timeout.")
-
+                
+                time.sleep(1)
+                self.logger.info("Selecting thumbnail...")
                 try:
-                    context.close()
-                    browser.close()
-                except Exception:
-                    pass
+                    thumbs = page.locator('div.thumbContainers a')
+                    if thumbs.count() > 0:
+                        thumbs.first.click()
+                    else:
+                        self.logger.warning("No thumbnails found")
+                except Exception as e:
+                    self.logger.warning(f"Could not select thumbnail: {e}")
+                                
+                time.sleep(1)
+                page.click('#submitForm')
+                page.wait_for_load_state('load', timeout=120000)
+                page.wait_for_selector('a[crcval="6"]', timeout=60000)
+                page.click('a[crcval="6"]')
+                time.sleep(1)
 
-                return video_url or "https://rumble.com/"  # Return homepage if exact URL unknown
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(2)
+                
+                page.wait_for_selector('label[for="crights"]', timeout=30000)
+                page.click('label[for="crights"]')
+                
+                page.wait_for_selector('label[for="cterms"]', timeout=30000)
+                page.click('label[for="cterms"]')
+                
+                time.sleep(1)
+                page.click('#submitForm2')
+                page.wait_for_load_state('load', timeout=120000)
+                
+                # Wait for upload completion confirmation
+                upload_confirmed = False
+                
+                for _ in range(24):  # Wait up to 2 minutes
+                    try:
+                        # Check for success indicators - multiple possible texts
+                        success_indicators = [
+                            'text=/Video Upload Complete/i',
+                            'text=/success/i', 
+                            'text=/complete/i',
+                            'text=/published/i',
+                            'text=/uploaded/i',
+                            'h3.title:has-text("Video Upload Complete")',
+                            'text=/upload.*complete/i',
+                            'text=/successfully.*uploaded/i'
+                        ]
+                        
+                        for indicator in success_indicators:
+                            success_element = page.locator(indicator).first
+                            if success_element.is_visible():
+                                success_text = success_element.text_content()
+                                self.logger.info(f"✓ Upload completed! Found: '{success_text}'")
+                                upload_confirmed = True
+                                break
+                        
+                        if upload_confirmed:
+                            break
+                            
+                    except Exception as e:
+                        self.logger.debug(f"Success check error: {e}")
+                    
+                    time.sleep(5)
+                
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Upload failed: {e}")
+                return False
+                
+            finally:
+                context.close()
+                browser.close()
 
-        except Exception as e:
-            self.logger.error(f"Playwright upload error: {e}")
-            return None
+        return False
     
     def _prepare_youtube_metadata(self, metadata: Dict[str, Any], video_path: str) -> Dict[str, Any]:
         """Prepare metadata for YouTube upload."""
-        # Adjust title for Shorts
-        title = metadata.get('title', 'Untitled Video')[:100]
+        # Adjust title for Shorts with safe defaults
+        fallback_title = getattr(self.config, 'METADATA_FALLBACK_TITLE', 'Wildlife Highlight')
+        base_title = metadata.get('title') or fallback_title
+        title = str(base_title).strip()[:100] or 'Untitled Video'
         if getattr(self.config, 'YOUTUBE_FORCE_SHORTS_HASHTAG', True):
             if '#shorts' not in title.lower():
                 title = f"{title} #shorts"
@@ -429,11 +471,19 @@ class VideoUploader:
         # Kids setting
         made_for_kids = getattr(self.config, 'YOUTUBE_MADE_FOR_KIDS', False)
 
+        # Normalize fields
+        description = (metadata.get('description') or '').strip()
+        tags_raw = metadata.get('tags') or []
+        if isinstance(tags_raw, str):
+            tags = [t.strip() for t in tags_raw.split(',') if t.strip()]
+        else:
+            tags = [str(t).strip() for t in tags_raw if str(t).strip()]
+
         return {
             'snippet': {
                 'title': title,
-                'description': metadata.get('description', '')[:5000],
-                'tags': metadata.get('tags', [])[:500],  # YouTube limit
+                'description': description[:5000],
+                'tags': tags[:500],  # YouTube limit
                 'categoryId': metadata.get('category_id', '15'),  # Pets & Animals
                 'defaultLanguage': 'en',
                 'defaultAudioLanguage': 'en'
@@ -451,11 +501,13 @@ class VideoUploader:
         """Execute the actual YouTube upload."""
         try:
             # Create upload request
+            import mimetypes
+            mime = mimetypes.guess_type(video_path)[0] or 'application/octet-stream'
             media_body = googleapiclient.http.MediaFileUpload(
                 video_path,
                 chunksize=-1,  # Upload in single chunk
                 resumable=True,
-                mimetype='video/mp4'
+                mimetype=mime
             )
             
             insert_request = self.youtube_service.videos().insert(
@@ -491,84 +543,6 @@ class VideoUploader:
             
         except Exception as e:
             raise YouTubeUploadError(f"YouTube upload execution failed: {e}")
-    
-    def _rumble_login(self) -> bool:
-        """Login to Rumble."""
-        try:
-            # Get login page
-            login_url = "https://rumble.com/login.php"
-            response = self.rumble_session.get(login_url, timeout=30)
-            
-            if response.status_code != 200:
-                return False
-            
-            # Extract CSRF token or other required fields
-            # This is a simplified implementation - actual Rumble login may require more steps
-            login_data = {
-                'username': self.config.RUMBLE_USERNAME,
-                'password': self.config.RUMBLE_PASSWORD,
-            }
-            
-            # Submit login
-            response = self.rumble_session.post(login_url, data=login_data, timeout=30)
-            
-            # Check if login was successful
-            if "dashboard" in response.url.lower() or response.status_code == 200:
-                return True
-            else:
-                self.logger.error(f"Rumble login failed: {response.status_code}")
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"Rumble login error: {e}")
-            return False
-    
-    def _execute_rumble_upload(self, video_path: str, title: str, description: str, tags: List[str]) -> Optional[str]:
-        """Execute Rumble upload (simplified implementation)."""
-        try:
-            # This is a simplified implementation
-            # Actual Rumble upload would require:
-            # 1. Getting upload form and tokens
-            # 2. Uploading video file
-            # 3. Setting metadata
-            # 4. Publishing video
-            
-            upload_url = "https://rumble.com/upload.php"
-            
-            # Prepare upload data
-            files = {
-                'video': (Path(video_path).name, open(video_path, 'rb'), 'video/mp4')
-            }
-            
-            data = {
-                'title': title[:100],
-                'description': description[:2000],
-                'tags': ','.join(tags[:10]),
-                'category': 'Nature',
-                'privacy': 'public'
-            }
-            
-            # Upload (this is a mock - actual implementation would be more complex)
-            response = self.rumble_session.post(
-                upload_url,
-                files=files,
-                data=data,
-                timeout=getattr(self.config, 'RUMBLE_UPLOAD_TIMEOUT', 600)
-            )
-            
-            files['video'][1].close()  # Close file
-            
-            if response.status_code == 200:
-                # Parse response for video URL
-                self.last_rumble_upload = time.time()
-                return "https://rumble.com/video/uploaded"  # Mock URL
-            else:
-                self.logger.error(f"Rumble upload response: {response.status_code} {response.text}")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"Rumble upload execution failed: {e}")
-            return None
     
     def _enforce_rate_limiting(self, platform: str) -> None:
         """Enforce rate limiting between uploads."""
@@ -623,24 +597,3 @@ class VideoUploader:
                 
         except Exception as e:
             self.logger.debug(f"Could not log upload: {e}")
-    
-    def get_upload_stats(self) -> Dict[str, Any]:
-        """Get upload statistics."""
-        try:
-            stats = self.upload_history.get('stats', {})
-            recent_uploads = len([
-                u for u in self.upload_history.get('uploads', [])
-                if (datetime.now() - datetime.fromisoformat(u['timestamp'])).days < 7
-            ])
-            
-            return {
-                'total_youtube_uploads': stats.get('youtube', 0),
-                'total_rumble_uploads': stats.get('rumble', 0),
-                'uploads_last_7_days': recent_uploads,
-                'services_available': {
-                    'youtube': self.youtube_initialized,
-                    'rumble': self.rumble_initialized
-                }
-            }
-        except:
-            return {'error': 'Could not get stats'}
