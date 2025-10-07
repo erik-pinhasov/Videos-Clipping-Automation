@@ -1,7 +1,3 @@
-"""
-Creates video clips with viral-style subtitles and optimal formatting for YouTube Shorts.
-"""
-
 import os
 import subprocess
 import json
@@ -60,13 +56,7 @@ class ClipCreator:
             }
         }
         
-        # HF API for speech-to-text
-        self.hf_token = getattr(cfg, 'HUGGING_FACE_TOKEN', None)
-        self.hf_headers = {"Authorization": f"Bearer {self.hf_token}"} if self.hf_token else {}
-        
-        # Track HF usage
-        self.hf_usage_file = "hf_subtitle_usage.json"
-        self.hf_usage = self._load_hf_usage()
+    # OpenAI API for speech-to-text
     
     def create_clips(self, video_path: str, highlights: List[Dict[str, Any]], 
                     video_id: str, channel: str) -> List[str]:
@@ -79,12 +69,11 @@ class ClipCreator:
             self.logger.info(f"Creating {len(highlights)} clips with subtitles...")
             
             created_clips = []
-            
             for i, highlight in enumerate(highlights):
+                clip_number = i + 1
                 try:
-                    clip_number = i + 1
-                    self.logger.info(f"  Creating clip {clip_number}/{len(highlights)}...")
-                    
+                    # OpenAI API for speech-to-text
+                    self.openai_api_key = getattr(self.config, 'OPENAI_API_KEY', None)
                     # Create base clip
                     clip_path = self._create_base_clip(
                         video_path, highlight, video_id, clip_number
@@ -94,10 +83,13 @@ class ClipCreator:
                         self.logger.error(f"  Failed to create base clip {clip_number}")
                         continue
                     
-                    # Add subtitles
-                    final_clip_path = self._add_subtitles_to_clip(
-                        clip_path, highlight, channel, clip_number
-                    )
+                    # Add subtitles unless disabled by config
+                    if getattr(self.config, 'SUBTITLES_MODE', 'exact') == 'off':
+                        final_clip_path = clip_path
+                    else:
+                        final_clip_path = self._add_subtitles_to_clip(
+                            clip_path, highlight, channel, clip_number
+                        )
                     
                     if final_clip_path and Path(final_clip_path).exists():
                         created_clips.append(final_clip_path)
@@ -109,7 +101,7 @@ class ClipCreator:
                             created_clips.append(clip_path)
                     
                 except Exception as e:
-                    self.logger.error(f"  Failed to create clip {i+1}: {e}")
+                    self.logger.error(f"  Failed to create clip {clip_number}: {e}")
                     continue
             
             self.logger.info(f"Successfully created {len(created_clips)} clips")
@@ -139,12 +131,21 @@ class ClipCreator:
             clip_filename = f"{video_id}_clip_{clip_number}.mp4"
             clip_path = os.path.join(self.config.CLIPS_DIR, clip_filename)
             
-            # Create clip with optimal settings for Shorts
+            # Create clip with optimal settings for Shorts and convert to 9:16 with blurred background
+            # Pipeline: scale original to fit height 1920, crop/pad to 1080x1920 with blurred background
+            vf = (
+                "[0:v]scale=-2:1920:flags=lanczos,boxblur=luma_radius=20:luma_power=1:chroma_radius=20:chroma_power=1[bg];"
+                "[0:v]scale=1080:-2:flags=lanczos,setsar=1[fg];"
+                "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p"
+            )
             cmd = [
                 'ffmpeg', '-y',
                 '-ss', str(start_time),
                 '-i', video_path,
                 '-t', str(end_time - start_time),
+                '-filter_complex', vf,
+                '-r', '30',
+                '-s', '1080x1920',
                 '-c:v', 'libx264',
                 '-preset', 'medium',
                 '-crf', '23',  # Good quality for mobile viewing
@@ -202,37 +203,26 @@ class ClipCreator:
             return clip_path
     
     def _generate_clip_transcript(self, clip_path: str, channel: str) -> Optional[Dict[str, Any]]:
-        """Generate transcript using HF Whisper model."""
+        """Generate transcript using OpenAI Whisper API (exact segments when available)."""
         try:
-            # Check HF quota
-            if self._check_hf_quota_exceeded():
-                self.logger.warning("HF quota exceeded, skipping subtitle generation")
-                return None
-            
             # Extract audio from clip
             audio_path = self._extract_audio_for_transcription(clip_path)
-            
             if not audio_path:
                 return None
-            
-            # Get transcript from HF
-            transcript = self._transcribe_with_hf(audio_path)
-            
+            transcript = self._transcribe_with_openai(audio_path)
             # Cleanup temp audio file
             try:
                 if Path(audio_path).exists():
                     Path(audio_path).unlink()
             except:
                 pass
-            
             if transcript:
-                # Enhance transcript with AI if available
+                # If we got structured segments, prefer them; otherwise enhance plain text
+                if isinstance(transcript, dict) and 'segments' in transcript:
+                    return transcript
                 enhanced_transcript = self._enhance_transcript(transcript, channel)
-                self._track_hf_usage()
                 return enhanced_transcript
-            
             return None
-            
         except Exception as e:
             self.logger.error(f"Transcript generation failed: {e}")
             return None
@@ -266,35 +256,52 @@ class ClipCreator:
             self.logger.error(f"Audio extraction error: {e}")
             return None
     
-    def _transcribe_with_hf(self, audio_path: str) -> Optional[str]:
-        """Transcribe audio using HF Whisper model."""
+    def _transcribe_with_openai(self, audio_path: str) -> Optional[Dict[str, Any] | str]:
+        """Transcribe audio using OpenAI Whisper API.
+        Returns:
+          - dict with 'segments' when verbose JSON is available (exact narrator timing)
+          - or plain string text when only 'text' is returned
+        """
         try:
-            # Read audio file
+            import requests
             with open(audio_path, 'rb') as f:
                 audio_data = f.read()
-            
-            # HF Whisper API endpoint
-            api_url = "https://api-inference.huggingface.co/models/openai/whisper-base"
-            
-            response = requests.post(
-                api_url,
-                headers=self.hf_headers,
-                data=audio_data,
-                timeout=60
-            )
-            
+            api_url = "https://api.openai.com/v1/audio/transcriptions"
+            headers = {
+                "Authorization": f"Bearer {self.openai_api_key}"
+            }
+            files = {
+                "file": ("audio.wav", audio_data, "audio/wav")
+            }
+            model = getattr(self.config, 'WHISPER_MODEL', 'whisper-1')
+            # Request verbose_json for per-segment timing when available
+            data = {"model": model, "response_format": "verbose_json"}
+            response = requests.post(api_url, headers=headers, files=files, data=data, timeout=60)
             if response.status_code == 200:
                 result = response.json()
+                # Prefer segments if provided
+                if isinstance(result, dict) and 'segments' in result and result.get('segments'):
+                    segments = []
+                    for seg in result['segments']:
+                        try:
+                            segments.append({
+                                'text': seg.get('text', '').strip(),
+                                'start': float(seg.get('start', 0.0)),
+                                'end': float(seg.get('end', 0.0))
+                            })
+                        except Exception:
+                            continue
+                    return {'segments': segments, 'full_text': result.get('text', '').strip()}
+                # Fall back to plain text
                 return result.get('text', '').strip()
             elif response.status_code == 429:
-                self.logger.warning("HF API rate limit hit")
+                self.logger.warning("OpenAI API rate limit hit")
                 return None
             else:
-                self.logger.error(f"HF transcription failed: {response.status_code}")
+                self.logger.error(f"OpenAI transcription failed: {response.status_code} {response.text}")
                 return None
-                
         except Exception as e:
-            self.logger.error(f"HF transcription error: {e}")
+            self.logger.error(f"OpenAI transcription error: {e}")
             return None
     
     def _enhance_transcript(self, raw_transcript: str, channel: str) -> Dict[str, Any]:
@@ -388,6 +395,7 @@ class ClipCreator:
             
             # Build subtitle filter with viral styling
             subtitle_filter = self._build_subtitle_filter(srt_path, style)
+            self.logger.debug(f"Using subtitle filter: {subtitle_filter}")
             
             cmd = [
                 'ffmpeg', '-y',
@@ -420,49 +428,35 @@ class ClipCreator:
             return clip_path
     
     def _build_subtitle_filter(self, srt_path: str, style: Dict[str, str]) -> str:
-        """Build FFmpeg subtitle filter with viral styling."""
+        """Build FFmpeg subtitle filter with viral styling (properly escaped)."""
         try:
-            # Escape path for FFmpeg
+            # Escape path for FFmpeg on Windows (backslashes and colons)
             escaped_srt_path = srt_path.replace('\\', '\\\\').replace(':', '\\:')
-            
-            # Base subtitle filter
-            subtitle_filter = f"subtitles='{escaped_srt_path}'"
-            
-            # Add styling
-            style_options = []
-            
-            # Font and size
+
+            # Build single force_style string; do NOT repeat force_style to avoid filter parsing issues
+            kv = []
             if style.get('font'):
-                style_options.append(f"force_style='FontName={style['font']}'")
-            
+                kv.append(f"FontName={style['font']}")
             if style.get('size'):
-                style_options.append(f"force_style='FontSize={style['size']}'")
-            
-            # Colors
+                kv.append(f"FontSize={style['size']}")
             if style.get('color'):
-                # Convert color name/hex to subtitle format
-                color = self._convert_color_for_subtitles(style['color'])
-                style_options.append(f"force_style='PrimaryColour={color}'")
-            
+                kv.append(f"PrimaryColour={self._convert_color_for_subtitles(style['color'])}")
             if style.get('outline_color') and style.get('outline_width'):
-                outline_color = self._convert_color_for_subtitles(style['outline_color'])
-                outline_width = style['outline_width']
-                style_options.append(f"force_style='OutlineColour={outline_color},Outline={outline_width}'")
-            
-            # Positioning
+                kv.append(f"OutlineColour={self._convert_color_for_subtitles(style['outline_color'])}")
+                kv.append(f"Outline={style['outline_width']}")
             if style.get('position') == 'bottom':
-                style_options.append("force_style='Alignment=2'")  # Bottom center
-            
-            # Combine all style options
-            if style_options:
-                full_style = ','.join(style_options)
-                subtitle_filter = f"subtitles='{escaped_srt_path}':{full_style}"
-            
-            return subtitle_filter
-            
+                kv.append("Alignment=2")  # Bottom center
+
+            if kv:
+                style_str = ','.join(kv)
+                # Escape commas so ffmpeg doesn't split the filter graph
+                style_str_escaped = style_str.replace(',', '\\,')
+                return f"subtitles='{escaped_srt_path}':force_style='{style_str_escaped}'"
+            else:
+                return f"subtitles='{escaped_srt_path}'"
+
         except Exception as e:
             self.logger.debug(f"Subtitle filter building failed: {e}")
-            # Return basic filter as fallback
             escaped_srt_path = srt_path.replace('\\', '\\\\').replace(':', '\\:')
             return f"subtitles='{escaped_srt_path}'"
     
@@ -500,43 +494,4 @@ class ClipCreator:
         except:
             return "00:00:00,000"
     
-    def _load_hf_usage(self) -> Dict[str, Any]:
-        """Load HF usage tracking for subtitles."""
-        try:
-            if Path(self.hf_usage_file).exists():
-                with open(self.hf_usage_file, 'r') as f:
-                    data = json.load(f)
-                
-                from datetime import datetime
-                today = datetime.now().strftime('%Y-%m-%d')
-                if data.get('date') == today:
-                    return data
-            
-            from datetime import datetime
-            return {
-                'date': datetime.now().strftime('%Y-%m-%d'),
-                'calls': 0
-            }
-            
-        except:
-            from datetime import datetime
-            return {
-                'date': datetime.now().strftime('%Y-%m-%d'),
-                'calls': 0
-            }
-    
-    def _check_hf_quota_exceeded(self) -> bool:
-        """Check if HF quota is exceeded for subtitle generation."""
-        daily_limit = 30  # Conservative limit for transcription
-        return self.hf_usage['calls'] >= daily_limit
-    
-    def _track_hf_usage(self) -> None:
-        """Track HF usage for subtitles."""
-        try:
-            self.hf_usage['calls'] += 1
-            
-            with open(self.hf_usage_file, 'w') as f:
-                json.dump(self.hf_usage, f, indent=2)
-                
-        except Exception as e:
-            self.logger.debug(f"Could not track HF usage: {e}")
+    # Removed Hugging Face usage tracking and quota logic

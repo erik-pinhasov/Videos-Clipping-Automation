@@ -34,12 +34,7 @@ class ContentManager:
         self.used_videos_file = "used_videos.json"
         
         # Channel URLs - REAL CHANNELS
-        self.channel_urls = {
-            'naturesmomentstv': 'https://www.youtube.com/@naturesmomentstv/videos',
-            'navwildanimaldocumentary': 'https://www.youtube.com/@navwildanimaldocumentary/videos',
-            'wildnatureus2024': 'https://www.youtube.com/@wildnatureus2024/videos',
-            'ScenicScenes': 'https://www.youtube.com/@ScenicScenes/videos'
-        }
+        self.channel_urls = self.config.YOUTUBE_CHANNELS
     
     def get_new_videos(self) -> List[Dict[str, Any]]:
         """Get REAL videos from YouTube channels - ONE PER CHANNEL."""

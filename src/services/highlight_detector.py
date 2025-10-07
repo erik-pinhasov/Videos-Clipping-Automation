@@ -12,7 +12,7 @@ import requests
 from datetime import datetime
 import config
 from src.core.logger import get_logger
-from src.core.exceptions import HighlightDetectionError, HuggingFaceError
+from src.core.exceptions import HighlightDetectionError
 
 
 class HighlightDetector:
@@ -22,10 +22,6 @@ class HighlightDetector:
         self.config = cfg
         self.logger = get_logger(__name__)
         
-        # Hugging Face API setup
-        self.hf_token = getattr(cfg, 'HUGGING_FACE_TOKEN', None)
-        self.hf_headers = {"Authorization": f"Bearer {self.hf_token}"} if self.hf_token else {}
-        
         # Detection strategies per channel
         self.detection_strategies = {
             'naturesmomentstv': 'nature_documentary',
@@ -34,16 +30,7 @@ class HighlightDetector:
             'ScenicScenes': 'scenic'
         }
         
-        # HF models for different analysis types
-        self.models = {
-            'audio_classification': "facebook/wav2vec2-base-960h",
-            'scene_classification': "microsoft/DiT-base-finetuned-ade-512-512",
-            'video_analysis': "microsoft/xclip-base-patch32"
-        }
-        
-        # Usage tracking to avoid quota limits
-        self.usage_file = "hf_usage.json"
-        self.daily_usage = self._load_usage_tracking()
+        # No HF usage anymore; rely on local analysis only
     
     def detect(self, video_path: str, channel: str) -> List[Dict[str, Any]]:
         """Detect highlights using intelligent analysis."""
@@ -67,14 +54,7 @@ class HighlightDetector:
             motion_highlights = self._detect_motion_peaks(video_path, strategy)
             highlights.extend(motion_highlights)
             
-            # Method 3: HF-powered content analysis (limited usage)
-            if not self._check_quota_exceeded():
-                try:
-                    content_highlights = self._detect_content_highlights(video_path, strategy)
-                    highlights.extend(content_highlights)
-                    self._track_usage()
-                except Exception as e:
-                    self.logger.warning(f"HF content analysis failed: {e}")
+            # Method 3 removed: HF-powered content analysis is disabled
             
             # Process and rank highlights
             final_highlights = self._process_highlights(highlights, video_duration, strategy)
@@ -148,71 +128,24 @@ class HighlightDetector:
                     except (ValueError, IndexError):
                         continue
             
-            return highlights[:10]  # Limit to top 10 motion peaks
+            return highlights[:60]  # Allow more motion peaks for long videos
             
         except Exception as e:
             self.logger.debug(f"Motion peak detection failed: {e}")
             return []
     
-    def _detect_content_highlights(self, video_path: str, strategy: str) -> List[Dict[str, Any]]:
-        """Detect content-based highlights using HF models (limited usage)."""
-        try:
-            # Extract frames for analysis (only keyframes to save quota)
-            frames = self._extract_keyframes(video_path, max_frames=5)
-            
-            if not frames:
-                return []
-            
-            highlights = []
-            
-            # Analyze each frame with HF model
-            for frame_data in frames:
-                try:
-                    # Use scene classification model
-                    analysis = self._query_hf_model(
-                        self.models['scene_classification'],
-                        frame_data['image_data']
-                    )
-                    
-                    # Convert HF analysis to highlights based on strategy
-                    if self._is_interesting_scene(analysis, strategy):
-                        highlights.append({
-                            'start': max(0, frame_data['timestamp'] - 25),
-                            'end': frame_data['timestamp'] + 35,
-                            'score': 0.8,
-                            'type': 'content',
-                            'reason': f"Interesting {strategy} content detected"
-                        })
-                        
-                except Exception as e:
-                    self.logger.debug(f"Frame analysis failed: {e}")
-                    continue
-            
-            return highlights
-            
-        except Exception as e:
-            self.logger.warning(f"Content highlight detection failed: {e}")
-            return []
+    # Removed: _detect_content_highlights (HF models)
     
-    def _extract_keyframes(self, video_path: str, max_frames: int = 5) -> List[Dict[str, Any]]:
+    def _extract_keyframes(self, video_path: str, max_frames: int = 10) -> List[Dict[str, Any]]:
         """Extract keyframes for HF analysis."""
         try:
             duration = self._get_video_duration(video_path)
             
             # Get evenly spaced timestamps
             timestamps = []
-            if duration > 300:  # 5+ minutes
-                # Extract frames every 2 minutes
-                for i in range(0, int(duration), 120):
-                    timestamps.append(i + 60)  # Start 1 minute in
-                    if len(timestamps) >= max_frames:
-                        break
-            else:
-                # Extract frames every 30 seconds for shorter videos
-                for i in range(30, int(duration), 30):
-                    timestamps.append(i)
-                    if len(timestamps) >= max_frames:
-                        break
+            interval = max(60, duration // max_frames)  # Adjust interval based on video length
+            for i in range(0, int(duration), interval):
+                timestamps.append(i)
             
             frames = []
             for timestamp in timestamps:
@@ -244,64 +177,9 @@ class HighlightDetector:
             self.logger.debug(f"Keyframe extraction failed: {e}")
             return []
     
-    def _query_hf_model(self, model_name: str, data: Any) -> Dict[str, Any]:
-        """Query Hugging Face model with rate limiting."""
-        try:
-            api_url = f"https://api-inference.huggingface.co/models/{model_name}"
-            
-            # Prepare data for API
-            if isinstance(data, str):
-                # Base64 image data
-                import base64
-                payload = {"inputs": data}
-            else:
-                payload = {"inputs": data}
-            
-            response = requests.post(
-                api_url,
-                headers=self.hf_headers,
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                raise HuggingFaceError("HF API rate limit exceeded")
-            else:
-                raise HuggingFaceError(f"HF API error: {response.status_code}")
-                
-        except Exception as e:
-            raise HuggingFaceError(f"HF model query failed: {e}")
+    # Removed: _query_hf_model
     
-    def _is_interesting_scene(self, analysis: Dict[str, Any], strategy: str) -> bool:
-        """Determine if scene analysis indicates interesting content."""
-        try:
-            if not analysis or not isinstance(analysis, list):
-                return False
-            
-            # Get top predictions
-            top_prediction = analysis[0] if analysis else {}
-            confidence = top_prediction.get('score', 0)
-            label = top_prediction.get('label', '').lower()
-            
-            # Strategy-specific scene evaluation
-            if strategy == 'wildlife_action':
-                action_keywords = ['animal', 'wildlife', 'forest', 'water', 'bird', 'mammal']
-                return confidence > 0.6 and any(keyword in label for keyword in action_keywords)
-            
-            elif strategy == 'scenic':
-                scenic_keywords = ['landscape', 'mountain', 'sky', 'water', 'tree', 'field']
-                return confidence > 0.7 and any(keyword in label for keyword in scenic_keywords)
-            
-            elif strategy == 'nature_documentary':
-                nature_keywords = ['nature', 'outdoor', 'plant', 'animal', 'landscape']
-                return confidence > 0.6 and any(keyword in label for keyword in nature_keywords)
-            
-            return confidence > 0.8  # High confidence fallback
-            
-        except Exception:
-            return False
+    # Removed: _is_interesting_scene (HF analysis helper)
     
     def _process_highlights(self, raw_highlights: List[Dict[str, Any]], 
                           video_duration: float, strategy: str) -> List[Dict[str, Any]]:
@@ -319,8 +197,8 @@ class HighlightDetector:
                 start = max(0, highlight['start'])
                 end = min(video_duration - 5, highlight['end'])  # Leave 5s buffer
                 
-                # Ensure minimum clip length
-                if end - start >= 30:  # At least 30 seconds
+                # Ensure minimum clip length (we can extend short ones later during clip creation)
+                if end - start >= 20:  # At least 20 seconds
                     # Adjust for optimal short-form length (45-60s)
                     if end - start > 60:
                         end = start + 55  # Optimal shorts length
@@ -336,9 +214,33 @@ class HighlightDetector:
             # Sort by score (best first)
             valid_highlights.sort(key=lambda x: x['score'], reverse=True)
             
-            # Limit number based on video duration and quality
-            max_clips = min(len(valid_highlights), max(2, int(video_duration / 300)))
-            final_highlights = valid_highlights[:max_clips]
+            # Determine desired number of clips based on duration (~1 every 2 minutes)
+            desired_max = min(100, max(8, int(video_duration / 120)))
+
+            # If we don't have enough detected highlights, top up with evenly spaced fallbacks
+            if len(valid_highlights) < desired_max:
+                needed = desired_max - len(valid_highlights)
+                fallback = self._generate_evenly_spaced_highlights(video_duration, length=55, stride=120)
+
+                # Avoid heavy overlap with existing highlights (>= 15s overlap)
+                def overlaps(a, b):
+                    return not (a['end'] <= b['start'] + 5 or b['end'] <= a['start'] + 5)
+
+                selected = []
+                existing = valid_highlights.copy()
+                for h in fallback:
+                    too_close = any(overlaps(h, e) for e in existing)
+                    if not too_close:
+                        selected.append(h)
+                        existing.append(h)
+                    if len(selected) >= needed:
+                        break
+
+                valid_highlights.extend(selected)
+
+            # Now cap to desired_max, ordering by score then start time
+            valid_highlights.sort(key=lambda x: (-x.get('score', 0), x['start']))
+            final_highlights = valid_highlights[:desired_max]
             
             self.logger.info(f"Processed highlights: {len(raw_highlights)} → {len(final_highlights)} final clips")
             
@@ -347,6 +249,25 @@ class HighlightDetector:
         except Exception as e:
             self.logger.error(f"Highlight processing failed: {e}")
             return self._create_fallback_highlights_with_duration(video_duration)
+
+    def _generate_evenly_spaced_highlights(self, duration: float, length: int = 55, stride: int = 120) -> List[Dict[str, Any]]:
+        """Generate evenly spaced highlight windows across the video duration."""
+        highlights = []
+        if duration <= 0:
+            return highlights
+        start_time = 10  # small buffer at the beginning
+        last_start = max(10, duration - length - 5)
+        t = start_time
+        while t <= last_start:
+            highlights.append({
+                'start': t,
+                'end': t + length,
+                'score': 0.4,
+                'type': 'fallback',
+                'reason': 'Evenly spaced fallback'
+            })
+            t += stride
+        return highlights
     
     def _merge_overlapping_highlights(self, highlights: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Merge overlapping highlight segments."""
@@ -411,19 +332,8 @@ class HighlightDetector:
                 }
             ])
         else:  # 10+ minutes
-            # Create 3-4 evenly spaced highlights
-            section_length = duration / 4
-            for i in range(3):
-                start = (i + 1) * section_length
-                end = start + 50
-                if end < duration - 5:
-                    highlights.append({
-                        'start': start,
-                        'end': end,
-                        'score': 0.5,
-                        'type': 'fallback',
-                        'reason': f'Section {i+1} highlight'
-                    })
+            # Create many evenly spaced highlights (~every 2 minutes)
+            highlights = self._generate_evenly_spaced_highlights(duration, length=55, stride=120)
         
         return highlights
     
@@ -478,42 +388,4 @@ class HighlightDetector:
         
         return highlights
     
-    def _load_usage_tracking(self) -> Dict[str, Any]:
-        """Load HF API usage tracking."""
-        try:
-            if Path(self.usage_file).exists():
-                with open(self.usage_file, 'r') as f:
-                    data = json.load(f)
-                
-                today = datetime.now().strftime('%Y-%m-%d')
-                if data.get('date') == today:
-                    return data
-            
-            return {
-                'date': datetime.now().strftime('%Y-%m-%d'),
-                'calls': 0,
-                'quota_exceeded': False
-            }
-            
-        except Exception:
-            return {
-                'date': datetime.now().strftime('%Y-%m-%d'), 
-                'calls': 0,
-                'quota_exceeded': False
-            }
-    
-    def _check_quota_exceeded(self) -> bool:
-        """Check if HF quota is exceeded."""
-        daily_limit = 50  # Conservative limit for free tier
-        return self.daily_usage['calls'] >= daily_limit or self.daily_usage.get('quota_exceeded', False)
-    
-    def _track_usage(self) -> None:
-        """Track HF API usage."""
-        try:
-            self.daily_usage['calls'] += 1
-            
-            with open(self.usage_file, 'w') as f:
-                json.dump(self.daily_usage, f, indent=2)
-                
-        except Exception as e:
-            self.logger.debug(f"Could not track HF usage: {e}")
+    # Removed: _load_usage_tracking and any hf_usage.json handling

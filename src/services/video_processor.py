@@ -2,13 +2,18 @@ import time
 import signal
 from pathlib import Path
 from typing import List, Dict, Any
-from src.core.exceptions import VideoProcessingError
+from src.core.exceptions import VideoProcessingError, DownloadError
 
 import config
 from src.core.logger import get_logger
 from src.services.content_manager import ContentManager
+from src.services.clip_creator import ClipCreator
+from src.services.branding import VideoBranding
+from src.services.highlight_detector import HighlightDetector
+from src.services.metadata_service import MetadataService
 import yt_dlp
 import subprocess
+import os
 
 
 class VideoProcessor:
@@ -104,33 +109,72 @@ class VideoProcessor:
             self.logger.error(f"Video processing failed: {e}")
             return False
     
-    def download_video(self, video_url: str, output_path: str) -> str:
-        """Download video using yt-dlp."""
+    def download_video(self, url: str) -> str:
+        """Download the given YouTube video URL using yt-dlp."""
         try:
+            self.logger.info(f"🔄 Downloading video: {url}")
             ydl_opts = {
-                'outtmpl': f"{output_path}/%(id)s.%(ext)s",
-                'quiet': True,
-                'no_warnings': True,
+                'format': 'bestvideo+bestaudio/best',
+                'outtmpl': f"{self.config.DOWNLOAD_DIR}/%(title)s.%(ext)s",
+                'quiet': False,
+                'cookiefile': 'cookies.txt',  # Use cookies for authentication
             }
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=True)
+                info = ydl.extract_info(url, download=True)
+                self.logger.info(f"✅ Successfully downloaded video: {info['title']}")
                 return ydl.prepare_filename(info)
         except Exception as e:
-            raise VideoProcessingError(f"Failed to download video: {e}")
+            self.logger.error(f"❌ Failed to download video: {e}")
+            raise DownloadError(f"Failed to download video: {e}")
     
-    def create_clips(self, video_path: str, clips_dir: str) -> List[str]:
-        """Create short clips using ffmpeg."""
-        # Example: Split video into 3 clips of 30 seconds each
-        clips = []
+    def create_clips(self, video_path: str, clips_dir: str, video_id: str, channel: str) -> List[str]:
+        """Create short clips with viral-style subtitles."""
         try:
-            for i in range(3):
-                clip_path = f"{clips_dir}/{Path(video_path).stem}_clip{i + 1}.mp4"
-                start_time = i * 30
-                subprocess.run([
-                    "ffmpeg", "-i", video_path, "-ss", str(start_time), "-t", "30",
-                    "-c:v", "libx264", "-c:a", "aac", clip_path
-                ], check=True)
-                clips.append(clip_path)
+            # Initialize HighlightDetector
+            highlight_detector = HighlightDetector(self.config)
+            
+            # Detect highlights
+            highlights = highlight_detector.detect(video_path, channel)
+            if not highlights:
+                raise VideoProcessingError("No highlights detected in the video.")
+            
+            # Create clips from highlights
+            clip_creator = ClipCreator(self.config)
+            clips = clip_creator.create_clips(video_path, highlights, video_id, channel)
             return clips
         except Exception as e:
             raise VideoProcessingError(f"Failed to create clips: {e}")
+
+    def _get_video_duration(self, video_path: str) -> int:
+        """Get the duration of a video in seconds."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+                capture_output=True, text=True
+            )
+            return int(float(result.stdout.strip()))
+        except Exception as e:
+            self.logger.error(f"Failed to get video duration: {e}")
+            return 0
+
+    def add_logo(self, video_path: str, output_dir: str, channel: str) -> str:
+        """Add a logo overlay to the video."""
+        try:
+            branding = VideoBranding(self.config)
+            output_path = os.path.join(output_dir, f"{Path(video_path).stem}_branded.mp4")
+            return branding.add_logo(video_path, output_path, channel)
+        except Exception as e:
+            raise VideoProcessingError(f"Failed to add logo: {e}")
+
+    def generate_metadata(self, video_path: str, channel: str) -> Dict[str, Any]:
+        """Generate metadata for the video using OpenAI API."""
+        try:
+            from src.services.metadata_service import MetadataService
+            metadata_service = MetadataService(self.config)
+            title = Path(video_path).stem
+            metadata = metadata_service.generate_metadata(title, channel)
+            return metadata
+        except Exception as e:
+            raise VideoProcessingError(f"Failed to generate metadata: {e}")
