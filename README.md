@@ -98,8 +98,8 @@ Before running this, make sure you have:
 
 **1. Clone and setup:**
 ```bash
-git clone https://github.com/yourusername/youtube-rumble-automation.git
-cd youtube-rumble-automation
+git clone https://github.com/erik-pinhasov/Videos-Clipping-Automation.git
+cd Videos-Clipping-Automation
 
 # Create a virtual environment (recommended)
 python -m venv venv
