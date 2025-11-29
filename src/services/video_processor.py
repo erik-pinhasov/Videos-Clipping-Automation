@@ -1,19 +1,17 @@
 import time
 import signal
+import os
+import subprocess
+import yt_dlp
+import config
 from pathlib import Path
 from typing import List, Dict, Any
-from src.core.exceptions import VideoProcessingError, DownloadError
-
-import config
 from src.core.logger import get_logger
+from src.core.exceptions import VideoProcessingError, DownloadError
 from src.services.content_manager import ContentManager
 from src.services.clip_creator import ClipCreator
 from src.services.branding import VideoBranding
 from src.services.highlight_detector import HighlightDetector
-from src.services.metadata_service import MetadataService
-import yt_dlp
-import subprocess
-import os
 
 
 class VideoProcessor:
@@ -34,57 +32,7 @@ class VideoProcessor:
         """Handle Ctrl+C gracefully."""
         self.logger.info("🛑 Graceful shutdown requested...")
         self.should_stop = True
-    
-    def run_automation(self, max_videos: int = 5) -> Dict[str, Any]:
-        """Run simple automation."""
-        try:
-            self.logger.info(f"🔍 Looking for {max_videos} videos to process...")
-            
-            # Get videos
-            videos = self.content_manager.get_new_videos()
-            if not videos:
-                return {'success': True, 'message': 'No videos found'}
-            
-            # Limit videos
-            videos = videos[:max_videos]
-            
-            self.logger.info(f"📹 Found {len(videos)} videos to process")
-            
-            # Process each video
-            processed = 0
-            for i, video in enumerate(videos):
-                if self.should_stop:
-                    self.logger.info("🛑 Stopping due to user request")
-                    break
-                
-                self.logger.info(f"Processing video {i+1}/{len(videos)}: {video['title'][:50]}...")
-                
-                # Simulate processing (replace with actual processing)
-                success = self._process_video(video)
-                
-                if success:
-                    processed += 1
-                    self.logger.info(f"✅ Video {i+1} completed")
-                else:
-                    self.logger.error(f"❌ Video {i+1} failed")
-                
-                # Check for stop signal
-                if self.should_stop:
-                    break
-                
-                # Brief pause
-                time.sleep(2)
-            
-            return {
-                'success': True,
-                'processed': processed,
-                'total': len(videos)
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Automation failed: {e}")
-            return {'success': False, 'error': str(e)}
-    
+
     def _process_video(self, video: Dict[str, Any]) -> bool:
         """Process single video (simplified for now)."""
         try:
@@ -267,7 +215,6 @@ class VideoProcessor:
     def _get_video_duration(self, video_path: str) -> int:
         """Get the duration of a video in seconds."""
         try:
-            import subprocess
             result = subprocess.run(
                 ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
                 capture_output=True, text=True
@@ -285,15 +232,3 @@ class VideoProcessor:
             return branding.add_logo(video_path, output_path, channel)
         except Exception as e:
             raise VideoProcessingError(f"Failed to add logo: {e}")
-
-    def generate_metadata(self, video_path: str, channel: str) -> Dict[str, Any]:
-        """Generate metadata for the video using OpenAI API."""
-        try:
-            from src.services.metadata_service import MetadataService
-            metadata_service = MetadataService(self.config)
-            original_title = Path(video_path).stem
-            # Respect config flag in MetadataService; it will ignore original title if configured to do so
-            metadata = metadata_service.generate(video_path, channel, original_title=original_title)
-            return metadata
-        except Exception as e:
-            raise VideoProcessingError(f"Failed to generate metadata: {e}")

@@ -1,8 +1,5 @@
-"""
-Service modules for the YouTube Shorts Automation Pipeline.
-"""
+"""Service modules for YouTube to Rumble automation pipeline."""
 
-# Only import services that exist
 from .youtube_api import YouTubeAPI
 from .content_manager import ContentManager
 from .downloader import VideoDownloader

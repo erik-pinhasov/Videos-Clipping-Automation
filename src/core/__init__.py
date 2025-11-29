@@ -1,36 +1,48 @@
-from .logger import setup_logging, get_logger, LoggerMixin, log_function_call
-from .cleanup import ResourceCleaner
+"""Core utilities for YouTube to Rumble automation."""
+
+from .logger import setup_logging, get_logger
 from .exceptions import (
-    AutomationError, 
-    VideoProcessingError, 
-    DownloadError, 
+    AutomationError,
+    VideoProcessingError,
+    DownloadError,
     UploadError,
     YouTubeUploadError,
+    YouTubeAPIError,
     RumbleUploadError,
     MetadataError,
     OpenAIError,
     QuotaExceededError,
-    HuggingFaceError,
     HighlightDetectionError,
-    ClipCreationError
+    ClipCreationError,
+    ContentDiscoveryError,
+    ConfigurationError,
+    BrandingError,
+    TranscriptionError
 )
 
 __all__ = [
-    'ResourceCleaner',
-    'setup_logging', 
-    'get_logger', 
-    'LoggerMixin', 
-    'log_function_call',
+    # Logging
+    'setup_logging',
+    'get_logger',
+    # Base exceptions
     'AutomationError',
+    # Processing exceptions
     'VideoProcessingError',
     'DownloadError',
+    'ContentDiscoveryError',
+    'BrandingError',
+    'HighlightDetectionError',
+    'ClipCreationError',
+    'TranscriptionError',
+    # Upload exceptions
     'UploadError',
     'YouTubeUploadError',
+    'YouTubeAPIError',
     'RumbleUploadError',
+    # AI/API exceptions
     'MetadataError',
     'OpenAIError',
     'QuotaExceededError',
-    'HuggingFaceError',
-    'HighlightDetectionError',
-    'ClipCreationError'
+    # Config exceptions
+    'ConfigurationError'
 ]

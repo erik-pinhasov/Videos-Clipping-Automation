@@ -1,11 +1,9 @@
 import os
 import subprocess
-import json
 import tempfile
+import config
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-import requests
-import config
 from src.core.logger import get_logger
 from src.core.exceptions import ClipCreationError
 
@@ -20,15 +18,19 @@ class ClipCreator:
         # Ensure clips directory exists
         Path(self.config.CLIPS_DIR).mkdir(parents=True, exist_ok=True)
         
-        # Viral subtitle styling (consistent professional look)
-        self.subtitle_styles = {
-            'naturesmomentstv': { 'font': 'Arial', 'size': 52, 'color': 'white', 'outline_color': 'black', 'outline_width': 6, 'bold': 1, 'shadow': 0, 'spacing': 0, 'margin_v': 110, 'position': 'bottom' },
-            'navwildanimaldocumentary': { 'font': 'Arial', 'size': 52, 'color': 'white', 'outline_color': 'black', 'outline_width': 6, 'bold': 1, 'shadow': 0, 'spacing': 0, 'margin_v': 110, 'position': 'bottom' },
-            'wildnatureus2024': { 'font': 'Arial', 'size': 52, 'color': 'white', 'outline_color': 'black', 'outline_width': 6, 'bold': 1, 'shadow': 0, 'spacing': 0, 'margin_v': 110, 'position': 'bottom' },
-            'ScenicScenes': { 'font': 'Arial', 'size': 52, 'color': 'white', 'outline_color': 'black', 'outline_width': 6, 'bold': 1, 'shadow': 0, 'spacing': 0, 'margin_v': 110, 'position': 'bottom' }
+        # Professional subtitle styling for YouTube Shorts
+        self.subtitle_style = {
+            'font': 'Arial',
+            'size': 52,
+            'color': 'white',
+            'outline_color': 'black',
+            'outline_width': 6,
+            'bold': 1,
+            'shadow': 0,
+            'spacing': 0,
+            'margin_v': 110,
+            'position': 'bottom'
         }
-        
-    # OpenAI API for speech-to-text
     
     def create_clips(self, video_path: str, highlights: List[Dict[str, Any]], 
                     video_id: str, channel: str) -> List[str]:
@@ -381,9 +383,9 @@ class ClipCreator:
             return None
     
     def _burn_subtitles_to_video(self, clip_path: str, srt_path: str, channel: str) -> Optional[str]:
-        """Burn subtitles into video with viral styling."""
+        """Burn subtitles into video with professional styling."""
         try:
-            style = self.subtitle_styles.get(channel, self.subtitle_styles['naturesmomentstv'])
+            style = self.subtitle_style
             
             # Output path
             clip_name = Path(clip_path).stem
@@ -497,5 +499,3 @@ class ClipCreator:
             
         except:
             return "00:00:00,000"
-    
-    # Removed Hugging Face usage tracking and quota logic

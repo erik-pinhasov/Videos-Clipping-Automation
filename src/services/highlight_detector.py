@@ -1,19 +1,13 @@
-"""
-Intelligent highlight detection using Hugging Face models and local analysis.
-"""
-
 import os
 import tempfile
 import json
 import subprocess
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
-import requests
-from datetime import datetime
+from typing import List, Dict, Any
+import openai
 import config
 from src.core.logger import get_logger
-from src.core.exceptions import HighlightDetectionError
-from src.services.metadata_service import MetadataService
+
 _VOSK_AVAILABLE = False
 def _vosk_available() -> bool:
     global _VOSK_AVAILABLE
@@ -29,26 +23,19 @@ def _vosk_available() -> bool:
 
 
 class HighlightDetector:
-    """Detects video highlights using multiple strategies and HF models."""
+    """Detects video highlights using AI and local analysis methods."""
     
     def __init__(self, cfg: config.Config):
         self.config = cfg
         self.logger = get_logger(__name__)
         
-        # Detection strategies per channel
-        self.detection_strategies = {
-            'naturesmomentstv': 'nature_documentary',
-            'navwildanimaldocumentary': 'wildlife_action',
-            'wildnatureus2024': 'scenic_nature',
-            'ScenicScenes': 'scenic'
-        }
-        
-        # No HF usage anymore; rely on local analysis only
-    
+        # Default detection strategy for nature/wildlife content
+        self.default_strategy = 'nature_documentary'
+            
     def detect(self, video_path: str, channel: str) -> List[Dict[str, Any]]:
         """Detect highlights using intelligent analysis."""
         try:
-            strategy = self.detection_strategies.get(channel, 'nature_documentary')
+            strategy = self.default_strategy
             self.logger.info(f"Using '{strategy}' detection strategy for highlight extraction")
             
             # Get video info first
@@ -74,9 +61,7 @@ class HighlightDetector:
             # Method 2: Local motion analysis (free, unlimited)  
             motion_highlights = self._detect_motion_peaks(video_path, strategy)
             highlights.extend(motion_highlights)
-            
-            # Method 3 removed: HF-powered content analysis is disabled
-            
+                        
             # Process and rank highlights
             final_highlights = self._process_highlights(highlights, video_duration, strategy)
             
@@ -107,8 +92,7 @@ class HighlightDetector:
                 return []
 
             # Step 2: Condense transcript and request windows from OpenAI
-            ms = MetadataService(self.config)
-            strategy = self.detection_strategies.get(channel, 'nature_documentary')
+            strategy = self.default_strategy
 
             prompt = f"""
 You are selecting the most engaging short highlight windows from a long {strategy} video (nature/wildlife).
@@ -124,7 +108,10 @@ Sparse transcript (approximate timeline):
 {sparse_transcript}
 """
 
-            resp = ms.client.chat.completions.create(
+            # Initialize OpenAI client
+            client = openai.OpenAI(api_key=self.config.OPENAI_API_KEY)
+            
+            resp = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": "You choose time windows for viral short clips from nature/wildlife content strictly within given constraints."},
@@ -320,53 +307,6 @@ Sparse transcript (approximate timeline):
         except Exception as e:
             self.logger.debug(f"Motion peak detection failed: {e}")
             return []
-    
-    # Removed: _detect_content_highlights (HF models)
-    
-    def _extract_keyframes(self, video_path: str, max_frames: int = 10) -> List[Dict[str, Any]]:
-        """Extract keyframes for HF analysis."""
-        try:
-            duration = self._get_video_duration(video_path)
-            
-            # Get evenly spaced timestamps
-            timestamps = []
-            interval = max(60, duration // max_frames)  # Adjust interval based on video length
-            for i in range(0, int(duration), interval):
-                timestamps.append(i)
-            
-            frames = []
-            for timestamp in timestamps:
-                try:
-                    # Extract frame as base64 for HF API
-                    cmd = [
-                        'ffmpeg', '-ss', str(timestamp), '-i', video_path,
-                        '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'
-                    ]
-                    
-                    result = subprocess.run(cmd, capture_output=True, timeout=30)
-                    
-                    if result.returncode == 0:
-                        import base64
-                        image_data = base64.b64encode(result.stdout).decode()
-                        
-                        frames.append({
-                            'timestamp': timestamp,
-                            'image_data': image_data
-                        })
-                        
-                except Exception as e:
-                    self.logger.debug(f"Frame extraction failed at {timestamp}s: {e}")
-                    continue
-            
-            return frames
-            
-        except Exception as e:
-            self.logger.debug(f"Keyframe extraction failed: {e}")
-            return []
-    
-    # Removed: _query_hf_model
-    
-    # Removed: _is_interesting_scene (HF analysis helper)
     
     def _process_highlights(self, raw_highlights: List[Dict[str, Any]], 
                           video_duration: float, strategy: str) -> List[Dict[str, Any]]:
@@ -575,5 +515,3 @@ Sparse transcript (approximate timeline):
         })
         
         return highlights
-    
-    # Removed: _load_usage_tracking and any hf_usage.json handling

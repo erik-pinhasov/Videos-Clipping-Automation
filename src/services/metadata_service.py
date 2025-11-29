@@ -1,16 +1,11 @@
-"""
-AI-powered metadata generation optimized for viral content using OpenAI.
-"""
-
-import os
 import json
-from pathlib import Path
-from typing import Dict, Any, List, Optional
-from datetime import datetime
 import openai
 import config
+from pathlib import Path
+from typing import Dict, Any, Optional
+from datetime import datetime
 from src.core.logger import get_logger
-from src.core.exceptions import MetadataError, OpenAIError, QuotaExceededError
+from src.core.exceptions import OpenAIError, QuotaExceededError
 
 
 class MetadataService:
@@ -27,28 +22,11 @@ class MetadataService:
         self.usage_file = "openai_usage.json"
         self.daily_usage = self._load_daily_usage()
         
-        # Viral content strategies per channel
-        self.channel_strategies = {
-            'naturesmomentstv': {
-                'focus': 'breathtaking nature moments',
-                'emotions': ['wonder', 'peace', 'amazement'],
-                'keywords': ['stunning', 'incredible', 'breathtaking', 'amazing', 'wild']
-            },
-            'navwildanimaldocumentary': {
-                'focus': 'wildlife behavior and animal interactions',
-                'emotions': ['excitement', 'curiosity', 'fascination'],
-                'keywords': ['epic', 'wild', 'incredible', 'rare', 'amazing']
-            },
-            'wildnatureus2024': {
-                'focus': 'pristine nature and scenic landscapes',
-                'emotions': ['tranquility', 'awe', 'serenity'],
-                'keywords': ['pristine', 'untouched', 'serene', 'beautiful', 'peaceful']
-            },
-            'ScenicScenes': {
-                'focus': 'relaxing and healing natural environments',
-                'emotions': ['calm', 'healing', 'relaxation'],
-                'keywords': ['relaxing', 'healing', 'peaceful', 'calming', 'therapeutic']
-            }
+        # Default content strategy (can be customized per channel)
+        self.default_strategy = {
+            'focus': 'nature and wildlife content',
+            'emotions': ['wonder', 'amazement', 'fascination'],
+            'keywords': ['amazing', 'incredible', 'stunning', 'beautiful', 'wild']
         }
     
     def generate(self, video_path: str, channel: str, original_title: str = None) -> Dict[str, Any]:
@@ -56,8 +34,11 @@ class MetadataService:
         try:
             self.logger.info("Generating AI metadata...")
 
-            # Get channel strategy
-            strategy = self.channel_strategies.get(channel, self.channel_strategies['naturesmomentstv'])
+            # Get channel-specific config or use default
+            channel_config = self.config.CHANNEL_LOGOS.get(channel, {})
+            strategy = self.default_strategy.copy()
+            if 'content_tags' in channel_config:
+                strategy['keywords'] = channel_config['content_tags']
             
             # Generate metadata using OpenAI
             # Respect config: optionally ignore original title influence
@@ -282,10 +263,9 @@ Format your response as JSON:
             self.logger.debug(f"Could not track usage: {e}")
     
     def enhance_subtitles(self, raw_transcript: str, channel: str) -> str:
-        """Enhance raw transcript for engaging subtitles (OpenAI task)."""
+        """Enhance raw transcript for engaging subtitles."""
         try:
-
-            strategy = self.channel_strategies.get(channel, self.channel_strategies['naturesmomentstv'])
+            strategy = self.default_strategy
             
             prompt = f"""
 Transform this raw transcript into engaging, viral-style subtitle text:

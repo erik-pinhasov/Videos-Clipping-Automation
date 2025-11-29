@@ -58,11 +58,6 @@ class QuotaExceededError(AutomationError):
     pass
 
 
-class HuggingFaceError(AutomationError):
-    """Error with HuggingFace API."""
-    pass
-
-
 class HighlightDetectionError(AutomationError):
     """Error during highlight detection."""
     pass

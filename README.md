@@ -1,58 +1,188 @@
-# YouTube & Rumble Shorts Automation
+# YouTube Videos Clipping Automation
 
-This project automates downloading long nature videos, creating wildlife highlight Shorts, and uploading them to YouTube and Rumble.
+A Python automation tool I built to streamline content distribution across multiple platforms. It downloads Creative Commons videos from YouTube, adds branding, and automatically creates short-form content for YouTube Shorts while uploading full videos to Rumble.
 
-## Rumble upload: simple direct flow
+[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![OpenAI](https://img.shields.io/badge/AI-OpenAI-412991.svg)](https://openai.com/)
 
-By default, the uploader now uses a simple and deterministic browser flow for Rumble:
 
-- Login to Rumble
-- Navigate directly to https://rumble.com/upload.php
-- Attach the video to the hidden input with id `#Filedata`
-- Fill title, description, tags
-- Set categories (Primary: Entertainment, Secondary: Wild Wildlife)
-- Select the first generated thumbnail
-- Click Upload, pick licensing “Rumble Only”, accept rights/terms, and Final Submit
+## What It Does
 
-You can control this with the environment variable:
+This project automates the entire workflow of repurposing long-form YouTube content into engaging short clips:
 
-- `RUMBLE_SIMPLE_FLOW=true` (default): Use the direct navigation to `upload.php`
-- `RUMBLE_SIMPLE_FLOW=false`: Use the more robust fallback flow if needed
+- Finds Creative Commons videos from specified YouTube channels
+- Downloads videos in the highest available quality
+- Adds custom logo watermarks with configurable positioning
+- Analyzes videos using AI to identify the most engaging moments
+- Creates 60-second vertical clips optimized for YouTube Shorts
+- Generates subtitles automatically using OpenAI's Whisper
+- Creates optimized titles, descriptions, and tags for better reach
+- Uploads full videos to Rumble and clips to YouTube Shorts
+- Keeps track of processed videos to avoid duplicates
 
-Other related settings (with defaults) are defined in `config.py` and can be set via environment variables:
+The system handles retries, manages API quotas, and logs everything for debugging. I built it to be configurable through environment variables so you can adapt it to your needs without changing code.
 
-- `RUMBLE_UPLOAD_METHOD=playwright` (recommended)
-- `PLAYWRIGHT_HEADLESS=false` to see the browser while debugging
-- `RUMBLE_UPLOAD_TIMEOUT_MS=10800000` (3 hours)
+## How It Works
 
-## Title and metadata behavior
+The pipeline processes videos in this order:
 
-Metadata is generated via OpenAI and avoids reusing the original YouTube title by default:
+1. **Download** → Grabs videos from YouTube channels using yt-dlp
+2. **Brand** → Adds your logo overlay using FFmpeg
+3. **Split** → Full video goes to Rumble, then we create clips
+4. **Analyze** → AI identifies engaging moments for short clips
+5. **Generate** → Creates 60-second vertical clips with subtitles
+6. **Optimize** → AI writes catchy titles and descriptions
+7. **Upload** → Clips go to YouTube Shorts, full video to Rumble
+8. **Track** → Saves progress to avoid reprocessing videos
 
-- `METADATA_USE_ORIGINAL_TITLE=false` (default): Generate a fresh title for each Short
-- `METADATA_FALLBACK_TITLE="Wildlife Highlight"`: Safe fallback if generation fails
-- `YOUTUBE_FORCE_SHORTS_HASHTAG=true`: Appends `#shorts` to titles if missing
+## 🏗️ Pipeline Flow
 
-## Quick start
-
-1) Set environment variables in a `.env` file (see keys in `config.py`):
-
-- OPENAI_API_KEY
-- YOUTUBE_API_KEY
-- YOUTUBE_CLIENT_SECRET_FILE
-- RUMBLE_USERNAME, RUMBLE_EMAIL, RUMBLE_PASSWORD
-
-2) Run the main automation:
-
-```powershell
-python .\main.py
+```
+┌─────────────────┐
+│  YouTube        │
+│  (CC Videos)    │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Download       │
+│  & Filter       │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Add Logo       │
+│  Watermark      │
+└────────┬────────┘
+         │
+         ├──────────────────┬───────────────┐
+         ▼                  ▼               ▼
+┌─────────────────┐  ┌──────────────┐  ┌──────────────┐
+│   Rumble        │  │  AI Analyze  │  │  Generate    │
+│ (Full Video)    │  │  Highlights  │  │  Metadata    │
+└─────────────────┘  └──────┬───────┘  └──────────────┘
+                            ▼
+                     ┌──────────────┐
+                     │  Create 60s  │
+                     │  Clips       │
+                     └──────┬───────┘
+                            ▼
+                     ┌──────────────┐
+                     │  Add AI      │
+                     │  Subtitles   │
+                     └──────┬───────┘
+                            ▼
+                     ┌──────────────┐
+                     │  YouTube     │
+                     │  Shorts      │
+                     └──────────────┘
 ```
 
-3) Test Rumble upload flow with a specific clip:
+## What You'll Need
 
-```powershell
-python .\scripts\rumble_upload_test.py
+Before running this, make sure you have:
+
+**Software:**
+- Python 3.9 or newer
+- FFmpeg installed and added to your PATH ([download here](https://ffmpeg.org/download.html))
+
+**API Access:**
+- YouTube Data API v3 credentials from [Google Cloud Console](https://console.cloud.google.com/apis/credentials)
+- OpenAI API key from [platform.openai.com](https://platform.openai.com/api-keys)
+- A Rumble account for uploading videos
+
+**Optional:**
+- Vosk for local transcription instead of OpenAI Whisper (saves API costs)
+
+## Installation
+
+**1. Clone and setup:**
+```bash
+git clone https://github.com/yourusername/youtube-rumble-automation.git
+cd youtube-rumble-automation
+
+# Create a virtual environment (recommended)
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+playwright install chromium
 ```
 
-If you see the browser fail to attach the file, keep `RUMBLE_SIMPLE_FLOW=true` and ensure the input `#Filedata` exists on your upload page variant. The uploader verifies that `#Filedata.files.length > 0` after selection.
+**2. Configure your environment:**
+```bash
+cp .env.example .env
+# Edit .env and add your API keys and credentials
+```
+
+**3. Set up YouTube OAuth:**
+- Go to [Google Cloud Console](https://console.cloud.google.com/)
+- Create a project and enable YouTube Data API v3
+- Create OAuth 2.0 credentials and download the JSON file
+- Save it as `credentials/client_secret.json`
+
+**4. Add your logo:**
+
+Put your logo in `media/assets/logo.png` (or specify a custom path in `.env`)
+
+**5. Configure channels to monitor:**
+
+Edit `.env` and add the YouTube channels you want to process:
+```env
+YOUTUBE_CHANNELS_JSON={"channel1": "https://www.youtube.com/@channel1/videos"}
+```
+
+**6. Run it:**
+```bash
+python main.py
+```
+
+The first run will ask you to authenticate with YouTube via OAuth. After that, it runs automatically.
+
+## Configuration
+
+All settings are in `.env`. Here are the important ones:
+
+**Required API keys and Rumble credentials:**
+```env
+YOUTUBE_API_KEY=your_key_here
+OPENAI_API_KEY=your_key_here
+RUMBLE_EMAIL=your@email.com
+RUMBLE_PASSWORD=your_password
+```
+
+## AI Features
+
+Integrated OpenAI's APIs for the intelligent parts:
+
+**Highlight Detection:** The system analyzes video transcripts to find the most engaging moments. It looks for action, emotion, and interesting events rather than just random clips.
+
+**Subtitles:** Whisper API transcribes the audio with accurate timing. The subtitles are formatted specifically for YouTube Shorts with bold text and positioning.
+
+**Metadata:** GPT-3.5 generates catchy titles, descriptions, and tags. I tuned the prompts to avoid generic titles and create content that actually performs well.
+
+
+## Important Notes
+
+**Legal stuff:**
+- Only use this with Creative Commons licensed content
+- Make sure you have the rights to upload and repurpose the videos
+- Respect YouTube and Rumble's terms of service
+- I'm not responsible for how you use this tool
+
+
+## Built With
+
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) - Video downloading
+- [OpenAI API](https://openai.com/) - AI features
+- [FFmpeg](https://ffmpeg.org/) - Video processing
+- [Playwright](https://playwright.dev/) - Browser automation
+- [Google YouTube API](https://developers.google.com/youtube/v3) - Video uploads
+
+---
+
+## Disclaimer
+
+This is a personal project I built for automating content workflows. Use it responsibly and respect copyright laws. Make sure you have the necessary rights to any content you process.
 

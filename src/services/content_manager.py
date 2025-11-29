@@ -1,44 +1,28 @@
-"""
-WORKING content manager - finds real YouTube videos.
-"""
-
-import os
 import json
-import sys
+import yt_dlp
+import config
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
-
-# Import yt-dlp properly
-try:
-    import yt_dlp
-except ImportError:
-    print("Installing yt-dlp...")
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "yt-dlp"])
-    import yt_dlp
-
-import config
 from src.core.logger import get_logger
-from src.core.exceptions import ContentDiscoveryError
 
 
 class ContentManager:
-    """WORKING content manager."""
+    """Manages content discovery and tracking from YouTube channels."""
     
     def __init__(self, cfg: config.Config):
         self.config = cfg
         self.logger = get_logger(__name__)
         
-        # File to track used videos
+        # Track processed videos
         self.used_videos_file = "used_videos.json"
         
-        # Channel URLs - REAL CHANNELS
+        # Configured YouTube channels
         self.channel_urls = self.config.YOUTUBE_CHANNELS
     
     def get_new_videos(self) -> List[Dict[str, Any]]:
-        """Get REAL videos from YouTube channels - ONE PER CHANNEL."""
-        self.logger.info("🔍 Getting REAL videos from YouTube...")
+        """Get new unprocessed videos from configured YouTube channels."""
+        self.logger.info("🔍 Discovering videos from YouTube channels...")
         
         used_videos = self._load_used_videos()
         all_videos = []
@@ -65,7 +49,7 @@ class ContentManager:
         return all_videos  # Return 1 video per channel (max 4 total)
     
     def _get_real_videos(self, channel_url: str, channel_name: str, used_videos: set) -> List[Dict[str, Any]]:
-        """Get REAL videos using yt-dlp."""
+        """Extract video information from YouTube channel using yt-dlp."""
         
         # First pass: use extract_flat to list recent entries quickly and avoid format probing errors
         ydl_opts = {
@@ -230,29 +214,3 @@ class ContentManager:
             return set()
         except:
             return set()
-    
-    def get_next_video(self) -> List[Dict[str, Any]]:
-        """Get the NEXT video to process (1 video, rotating channels)."""
-        self.logger.info("🔍 Getting next video from rotation...")
-        
-        used_videos = self._load_used_videos()
-        
-        # Try each channel in order until we find 1 video
-        for channel_name, channel_url in self.channel_urls.items():
-            self.logger.info(f"  📺 Checking {channel_name}...")
-            
-            try:
-                videos = self._get_real_videos(channel_url, channel_name, used_videos)
-                if videos:
-                    self.logger.info(f"    ✅ Found video: {videos[0]['title'][:50]}...")
-                    return [videos[0]]  # Return just 1 video
-                else:
-                    self.logger.info(f"    ❌ No new videos")
-                    
-            except Exception as e:
-                self.logger.error(f"    ❌ Failed {channel_name}: {e}")
-                continue
-        
-        # No videos found from any channel
-        self.logger.info("📭 No videos available from any channel")
-        return []

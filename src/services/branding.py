@@ -1,18 +1,17 @@
-import subprocess
 import config
 from src.core.logger import get_logger
 from src.core.exceptions import BrandingError
 
 
 class VideoBranding:
-    """Handles adaptive logo overlay with resolution scaling."""
+    """Handles logo overlay for video branding."""
     
     def __init__(self, cfg: config.Config):
         self.config = cfg
         self.logger = get_logger(__name__)
 
     def add_logo(self, input_path: str, output_path: str, channel: str) -> str:
-        """Add a logo overlay fast (QSV ICQ when available) with source-like quality."""
+        """Add a logo overlay to video with high quality encoding."""
         import os, subprocess
 
         # --- Read channel-specific placement ---

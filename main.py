@@ -1,18 +1,11 @@
-from datetime import datetime
 import sys
 import signal
-import time
 from pathlib import Path
-import openai
-import os
-from dotenv import load_dotenv
 import config
 from src.core.logger import setup_logging, get_logger
-from src.services.content_manager import ContentManager
 from src.services.metadata_service import MetadataService
 from src.services.video_processor import VideoProcessor
 from src.services.uploader import VideoUploader
-from src.core.cleanup import ResourceCleaner
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
@@ -22,33 +15,48 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 def main():
+    """Main automation pipeline."""
     try:
-        print("------------------ Starting Automation ------------------")
+        print("=" * 60)
+        print("YouTube to Rumble Automation Pipeline")
+        print("=" * 60)
         signal.signal(signal.SIGINT, signal_handler)
 
         # Setup
         setup_logging("INFO")
         logger = get_logger(__name__)
+        
+        logger.info("Initializing configuration...")
         cfg = config.Config()
+        
+        logger.info("Initializing processors...")
         video_processor = VideoProcessor(cfg)
         video_uploader = VideoUploader(cfg)
-        video_uploader.initialize()
+        
+        if not video_uploader.initialize():
+            logger.error("Failed to initialize upload services")
+            return
+            
         metadata_service = MetadataService(cfg)
+        
+        logger.info("✓ All services initialized successfully")
+        logger.info(f"Processing up to {cfg.MAX_VIDEOS_PER_SESSION} videos per session\n")
 
-        # CONTINUOUS LOOP - Process 1 video at a time
+        # Process videos (configurable: one-time or continuous)
         processed_count = 0
+        max_videos = cfg.MAX_VIDEOS_PER_SESSION
 
-        while True:
-            logger.info(f"\n🔄 Starting processing cycle #{processed_count + 1}")
+        while processed_count < max_videos:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing video {processed_count + 1}/{max_videos}")
+            logger.info(f"{'='*60}")
             logger.info("🔍 Finding next YouTube video...")
 
             # Get next video
             videos = video_processor.content_manager.get_new_videos()
             if not videos:
                 logger.info("📭 No new videos available")
-                logger.info("⏳ Waiting 30 minutes before checking again...")
-                time.sleep(1800)  # 30 minutes
-                continue
+                break
 
             video = videos[0]  # Process one video at a time
             processed_count += 1
@@ -193,32 +201,24 @@ def main():
                 wait_for_manual_fix()
                 break
 
+        logger.info(f"\n{'='*60}")
+        logger.info(f"✓ Session complete: {processed_count} videos processed")
+        logger.info(f"{'='*60}")
+
     except KeyboardInterrupt:
-        print(f"\n🛑 Stopped after processing {processed_count} videos")
+        print(f"\n\n🛑 Stopped by user after processing {processed_count} videos")
     except Exception as e:
         logger.error(f"💥 Critical error: {e}")
         import traceback
         traceback.print_exc()
 
-def log_openai_usage():
-    """Log OpenAI API usage to a file."""
-    try:
-        # Fetch usage details
-        usage = openai.Usage.retrieve()
-        total_tokens = usage.get("total_tokens", 0)
-        total_cost = usage.get("total_cost", 0.0)
-        
-        # Log usage
-        with open("openai_usage.log", "a") as log_file:
-            log_file.write(f"{datetime.now()} - Total Tokens: {total_tokens}, Total Cost: ${total_cost:.2f}\n")
-        
-        print(f"🔍 OpenAI Usage: {total_tokens} tokens used, ${total_cost:.2f} spent.")
-    except Exception as e:
-        print(f"⚠️ Failed to fetch OpenAI usage: {e}")
-
 def wait_for_manual_fix():
     """Wait for manual intervention before retrying."""
-    input("⚠️ Error occurred. Fix the issue and press Enter to retry...")
+    logger = get_logger(__name__)
+    logger.warning("⚠️ Error occurred. Manual intervention may be required.")
+    response = input("Press Enter to retry, or 'q' to quit: ").strip().lower()
+    if response == 'q':
+        raise KeyboardInterrupt("User chose to quit")
 
 if __name__ == "__main__":
     main()

@@ -1,10 +1,13 @@
 import time
 import json
+import subprocess
+import shutil
+import threading
+import config
+import requests
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime
-import threading
-import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -253,6 +256,8 @@ class VideoUploader:
     def upload_to_rumble(self, video_path: str, title: str, description: str, tags: List[str]) -> bool:
         """Upload video to Rumble synchronously and return the resulting URL if detected."""
         if not self.rumble_initialized or not self.rumble_session:
+            # Check and compress video if needed
+            video_path = self._check_and_compress_video(video_path)
             raise RumbleUploadError("Rumble service not initialized")
 
         self.logger.info(f"Starting Rumble upload: {Path(video_path).name}")
@@ -285,7 +290,10 @@ class VideoUploader:
 
         def _worker():
             try:
-                url = self.upload_rumble_and_get_url(video_path, title, description, tags)
+                # Check and compress video if needed  
+                processed_video_path = self._check_and_compress_video(video_path)
+                
+                url = self.upload_to_rumble(processed_video_path, title, description, tags)
                 with self._rumble_tasks_lock:
                     self._rumble_tasks[task_id]['status'] = 'success' if url else 'failed'
                     self._rumble_tasks[task_id]['result_url'] = url
@@ -597,3 +605,172 @@ class VideoUploader:
                 
         except Exception as e:
             self.logger.debug(f"Could not log upload: {e}")
+    
+    def _get_file_size_gb(self, file_path: str) -> float:
+        """Get file size in GB."""
+        try:
+            size_bytes = Path(file_path).stat().st_size
+            size_gb = size_bytes / (1024 * 1024 * 1024)
+            return size_gb
+        except Exception as e:
+            self.logger.error(f"Could not get file size for {file_path}: {e}")
+            return 0
+    
+    def _get_video_info(self, video_path: str) -> Dict[str, Any]:
+        """Get video information using ffprobe."""
+        try:
+            cmd = [
+                'ffprobe',
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_format',
+                '-show_streams',
+                video_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            data = json.loads(result.stdout)
+            
+            # Find video stream
+            video_stream = None
+            for stream in data.get('streams', []):
+                if stream.get('codec_type') == 'video':
+                    video_stream = stream
+                    break
+            
+            if not video_stream:
+                return {}
+            
+            duration = float(data.get('format', {}).get('duration', 0))
+            bitrate = int(data.get('format', {}).get('bit_rate', 0))
+            
+            return {
+                'duration': duration,
+                'bitrate': bitrate,
+                'width': video_stream.get('width', 0),
+                'height': video_stream.get('height', 0)
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Could not get video info for {video_path}: {e}")
+            return {}
+    
+    def _compress_video(self, input_path: str, output_path: str, target_size_gb: float = 14.0) -> bool:
+        """Compress video to target size using ffmpeg."""
+        try:
+            self.logger.info(f"Compressing video: {Path(input_path).name}")
+            
+            # Get video info
+            video_info = self._get_video_info(input_path)
+            duration = video_info.get('duration', 0)
+            
+            if duration <= 0:
+                self.logger.error("Could not determine video duration for compression")
+                return False
+            
+            # Calculate target bitrate (in bits per second)
+            # Target size in bytes = target_size_gb * 1024^3
+            # Bitrate = (target_size_bytes * 8) / duration_seconds
+            target_size_bytes = target_size_gb * 1024 * 1024 * 1024
+            target_bitrate = int((target_size_bytes * 8) / duration)
+            
+            # Leave some room for audio and container overhead
+            video_bitrate = int(target_bitrate * 0.9)  # 90% for video
+            audio_bitrate = 128000  # 128k for audio
+            
+            self.logger.info(f"Target video bitrate: {video_bitrate // 1000}k")
+            
+            # FFmpeg compression command
+            cmd = [
+                'ffmpeg',
+                '-i', input_path,
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '28',
+                '-maxrate', f'{video_bitrate}',
+                '-bufsize', f'{video_bitrate * 2}',
+                '-c:a', 'aac',
+                '-b:a', f'{audio_bitrate}',
+                '-movflags', '+faststart',
+                '-y',  # Overwrite output file
+                output_path
+            ]
+            
+            # Run compression
+            self.logger.info("Starting video compression (this may take a while)...")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                self.logger.error(f"FFmpeg compression failed: {result.stderr}")
+                return False
+            
+            # Check if compression was successful
+            if not Path(output_path).exists():
+                self.logger.error("Compressed file was not created")
+                return False
+            
+            # Log compression results
+            original_size = self._get_file_size_gb(input_path)
+            compressed_size = self._get_file_size_gb(output_path)
+            compression_ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
+            
+            self.logger.info(f"Compression complete:")
+            self.logger.info(f"  Original size: {original_size:.2f} GB")
+            self.logger.info(f"  Compressed size: {compressed_size:.2f} GB")
+            self.logger.info(f"  Size reduction: {compression_ratio:.1f}%")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Video compression failed: {e}")
+            return False
+    
+    def _check_and_compress_video(self, video_path: str) -> str:
+        """Check video size and compress if larger than 15GB. Returns path to final video."""
+        try:
+            file_size_gb = self._get_file_size_gb(video_path)
+            self.logger.info(f"Video file size: {file_size_gb:.2f} GB")
+            
+            # Rumble limit is 15GB
+            if file_size_gb <= 15.0:
+                self.logger.info("Video size is within Rumble's 15GB limit")
+                return video_path
+            
+            self.logger.warning(f"Video size ({file_size_gb:.2f} GB) exceeds Rumble's 15GB limit")
+            
+            # Create compressed filename
+            video_path_obj = Path(video_path)
+            compressed_path = video_path_obj.parent / f"{video_path_obj.stem}_compressed{video_path_obj.suffix}"
+            
+            # Compress video
+            compression_success = self._compress_video(video_path, str(compressed_path), target_size_gb=14.0)
+            
+            if compression_success:
+                # Verify compressed size
+                compressed_size = self._get_file_size_gb(str(compressed_path))
+                if compressed_size <= 15.0:
+                    self.logger.info(f"✓ Video compressed successfully to {compressed_size:.2f} GB")
+                    
+                    # Replace original with compressed version
+                    try:
+                        shutil.move(str(compressed_path), video_path)
+                        self.logger.info("✓ Replaced original video with compressed version")
+                        return video_path
+                    except Exception as e:
+                        self.logger.error(f"Could not replace original video: {e}")
+                        return str(compressed_path)
+                else:
+                    self.logger.warning(f"Compressed video ({compressed_size:.2f} GB) still too large")
+                    # Clean up compressed file if it's still too large
+                    try:
+                        Path(compressed_path).unlink()
+                    except:
+                        pass
+                    return video_path
+            else:
+                self.logger.error("Video compression failed, using original video")
+                return video_path
+                
+        except Exception as e:
+            self.logger.error(f"Error checking/compressing video: {e}")
+            return video_path
